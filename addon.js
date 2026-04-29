@@ -1,6 +1,6 @@
 /**
  * Stremio Dual Subtitles Addon
- * Fetches subtitles from OpenSubtitles and merges two languages into one file.
+ * Fetches subtitles from configured subtitle sources and merges two languages into one file.
  * Perfect for language learners who want to see both original and translation.
  */
 
@@ -101,6 +101,11 @@ const {
 } = require('./languages');
 const { alignAndMatch } = require('./lib/syncEngine');
 const { generateCandidatePairs } = require('./lib/sourceSelection');
+const {
+  fetchSubtitlesFromEnabledSources,
+  getEnabledSubtitleSources,
+  getSubtitleSourceSummary
+} = require('./lib/subtitleSources');
 
 // Match rate at or above this is considered "good enough" — we stop
 // trying further candidate pairs. Empirically high-quality matches land
@@ -176,36 +181,42 @@ async function fetchWithRetry(url, options = {}, retries = 2, backoffMs = 500) {
 }
 
 /**
- * Fetch all subtitles from OpenSubtitles API.
+ * Fetch all subtitles from enabled source adapters.
  */
-async function fetchAllSubtitles(imdbId, type, season = null, episode = null, videoParams = {}) {
-  let apiUrl = `https://opensubtitles-v3.strem.io/subtitles/${type}/tt${imdbId}`;
-
-  if (type === 'series' && season && episode) {
-    apiUrl += `:${season}:${episode}`;
-  }
-
-  // Add query params for better matching
-  const queryParams = [];
+async function fetchAllSubtitles(imdbId, type, season = null, episode = null, videoParams = {}, options = {}) {
   const normalizedVideoParams = normalizeVideoParams(videoParams);
-  if (normalizedVideoParams.filename) queryParams.push(`filename=${encodeURIComponent(normalizedVideoParams.filename)}`);
-  if (normalizedVideoParams.videoSize) queryParams.push(`videoSize=${encodeURIComponent(normalizedVideoParams.videoSize)}`);
-  if (normalizedVideoParams.videoHash) queryParams.push(`videoHash=${encodeURIComponent(normalizedVideoParams.videoHash)}`);
-  
-  if (queryParams.length > 0) {
-    apiUrl += `/${queryParams.join('&')}`;
-  }
-  
-  apiUrl += '.json';
 
   try {
-    const response = await fetchWithRetry(apiUrl, { timeout: 15000 });
-    
-    if (!response.data || !response.data.subtitles || response.data.subtitles.length === 0) {
+    const result = await fetchSubtitlesFromEnabledSources({
+      fetchWithRetry,
+      imdbId,
+      type,
+      season,
+      episode,
+      videoParams: normalizedVideoParams,
+      languages: options.languages || [],
+      env: options.env || process.env
+    });
+
+    const enabledNames = result.enabledSources.map(source => source.name).join(', ') || 'none';
+    debugServer.log(`Enabled subtitle sources: ${enabledNames}`);
+
+    for (const sourceResult of result.sourceResults) {
+      if (sourceResult.error) {
+        debugServer.warn(
+          `Subtitle source failed: ${sourceResult.source.name} - ` +
+          sanitizeForLogging(sourceResult.error.message || String(sourceResult.error))
+        );
+        continue;
+      }
+      debugServer.log(`Subtitle source ${sourceResult.source.name}: ${sourceResult.count} result(s)`);
+    }
+
+    if (!result.subtitles || result.subtitles.length === 0) {
       return null;
     }
 
-    return response.data.subtitles;
+    return result.subtitles;
   } catch (error) {
     debugServer.error('Error fetching subtitles:', sanitizeForLogging(error.message));
     return null;
@@ -509,7 +520,7 @@ function htmlEncodeSrt(text) {
     .replace(/>/g, '&gt;');
 }
 
-/** Muted color for secondary line; players that ignore <font> still have <b> + › marker. */
+/** Muted color for secondary line; players that ignore <font> still show both lines. */
 const DUAL_SUB_TRANS_COLOR = '#94a3b8';
 
 /**
@@ -841,8 +852,15 @@ async function subtitlesHandler({ type, id, extra, config }) {
     const videoParams = normalizeVideoParams(extra || {});
 
     // Fetch all subtitles
-    debugServer.log('Fetching subtitles from OpenSubtitles...');
-    const allSubtitles = await fetchAllSubtitles(imdbId, type, season, episode, videoParams);
+    debugServer.log('Fetching subtitles from enabled sources...');
+    const allSubtitles = await fetchAllSubtitles(
+      imdbId,
+      type,
+      season,
+      episode,
+      videoParams,
+      { languages: [mainLang, transLang] }
+    );
 
     if (!allSubtitles) {
       debugServer.warn('No subtitles found');
@@ -959,7 +977,8 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
       type, 
       season !== '0' ? season : null, 
       episode !== '0' ? episode : null,
-      normalizedVideoParams
+      normalizedVideoParams,
+      { languages: [mainLang, transLang] }
     );
 
     if (!allSubtitles) {
@@ -1047,6 +1066,9 @@ module.exports = {
     serializeVideoParams,
     buildDynamicSubtitleUrl,
     normalizeTimingSource,
+    fetchAllSubtitles,
+    getEnabledSubtitleSources,
+    getSubtitleSourceSummary,
     decodeSubtitleEntities,
     cleanSubtitleText
   }

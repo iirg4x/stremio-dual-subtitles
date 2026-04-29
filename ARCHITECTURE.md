@@ -12,8 +12,8 @@ to start. If you want to submit a change, pair this file with
 
 Stremio Dual Subtitles is a small, self-contained
 [Stremio Addon SDK](https://github.com/Stremio/stremio-addon-sdk) service
-written in plain Node.js (CommonJS). It fetches subtitles from
-OpenSubtitles for two languages, merges them line-by-line based on timing,
+written in plain Node.js (CommonJS). It fetches subtitles from enabled
+source adapters for two languages, merges them line-by-line based on timing,
 and returns a single SRT file that Stremio plays as one subtitle track.
 
 ```
@@ -24,8 +24,8 @@ and returns a single SRT file that Stremio plays as one subtitle track.
                                         |       ^
                                         v       |
                                  +-------------------+
-                                 |  OpenSubtitles    |
-                                 |  public endpoints |
+                                 | Subtitle sources  |
+                                 | OpenSubtitles etc |
                                  +-------------------+
 ```
 
@@ -39,9 +39,10 @@ the URL path (see [URL Configuration](#url-configuration)).
 | File                  | Responsibility                                                                 |
 | --------------------- | ------------------------------------------------------------------------------ |
 | `server.js`           | Express bootstrap, routing, rate limiting, static assets, SEO endpoints.       |
-| `addon.js`            | Stremio Addon SDK handler, OpenSubtitles fetch, SRT parsing + merging.          |
+| `addon.js`            | Stremio Addon SDK handler, source fetch orchestration, SRT parsing + merging. |
 | `encoding.js`         | Character-set detection (`chardet`) and conversion to UTF-8 (`iconv-lite`).    |
 | `languages.js`        | 70+ language map, display names, code normalization.                           |
+| `lib/subtitleSources.js` | Source registry plus OpenSubtitles and optional Wyzie adapters.              |
 | `landingTemplate.js`  | HTML for `/configure` (the landing page and live preview).                     |
 | `lib/debug.js`        | `debugServer` logger with `sanitizeForLogging` for safe request logging.       |
 | `lib/analytics.js`    | Opt-in, anonymous usage counters behind `ANALYTICS_SECRET`.                    |
@@ -87,7 +88,7 @@ server.js
    v
 addon.js: subtitlesHandler
    |
-   | asks OpenSubtitles for subtitles in each configured language
+   | asks enabled subtitle sources for subtitles in each configured language
    v
 returns an array of subtitle entries, each pointing at a dynamic /subs/... URL
 ```
@@ -101,7 +102,7 @@ Stremio player
    v
 server.js -> addon.js: generateDualSrt
    |
-   | fetch primary + secondary SRT/VTT from OpenSubtitles
+   | fetch primary + secondary SRT/VTT from the selected source URLs
    v
 encoding.js detects charset and decodes to UTF-8
    |
@@ -113,7 +114,7 @@ merge step pairs cues whose timestamps overlap (within tolerance)
    |
    v
 renderSrt emits a single SRT with primary as the top line (bold) and
-secondary prefixed with a marker + italic/muted styling when supported
+secondary as the second line with italic/muted styling when supported
    |
    v
 response sent with Cache-Control for intermediary caches
@@ -126,11 +127,10 @@ Cues from the two source tracks are paired like this:
 1. Walk the primary cues in time order.
 2. For each primary cue `P`, find all secondary cues `S` whose window
    overlaps `P` (with a small tolerance for sub-second drift).
-3. Emit one output cue spanning `P.start..P.end`, with:
+3. Emit one output cue spanning the selected timing source, with:
    - Line 1: `P.text` wrapped in `<b>`.
-   - Line 2: a visible marker (`›`) plus the overlapping `S.text`,
-     wrapped in `<i>` and a muted `<font color>` that players which render
-     SRT-with-HTML pick up.
+   - Line 2: overlapping `S.text` wrapped in `<i>` and a muted
+     `<font color>` that players which render SRT-with-HTML pick up.
 4. Secondary cues that never overlap a primary are emitted on their own as
    secondary-only cues, so meaningful translations are never dropped.
 

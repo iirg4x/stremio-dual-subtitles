@@ -1054,6 +1054,120 @@ test('alignAndMatch: piecewise-drifted track matches better with local offsets e
 });
 
 // ============================================================================
+// subtitleSources - source registry and optional adapters
+// ============================================================================
+console.log('\n--- subtitleSources ---');
+
+const {
+  SUBTITLE_SOURCES,
+  DEFAULT_WYZIE_SOURCES,
+  getEnabledSubtitleSources,
+  getSubtitleSourceSummary,
+  buildOpenSubtitlesStreamUrl,
+  buildWyzieSearchUrl,
+  _internal: {
+    normalizeWyzieSubtitle,
+    toOpenSubtitlesLanguageCode,
+    releaseToGroupKey
+  }
+} = require('./lib/subtitleSources');
+
+test('subtitleSources: registers requested source candidates', () => {
+  const ids = SUBTITLE_SOURCES.map(source => source.id);
+  for (const id of [
+    'opensubtitles',
+    'addic7ed',
+    'tvsubtitles',
+    'podnapisi',
+    'yify-yts',
+    'downsub',
+    'amara',
+    'subtitlecat',
+    'subtitlebot'
+  ]) {
+    assert.ok(ids.includes(id), `${id} should be registered`);
+  }
+});
+
+test('subtitleSources: only safe default source is enabled without optional keys', () => {
+  const enabled = getEnabledSubtitleSources({});
+  assert.deepStrictEqual(enabled.map(source => source.id), ['opensubtitles']);
+
+  const summary = getSubtitleSourceSummary({});
+  assert.strictEqual(summary.find(source => source.id === 'opensubtitles').enabled, true);
+  assert.strictEqual(summary.find(source => source.id === 'wyzie').enabled, false);
+  assert.strictEqual(summary.find(source => source.id === 'downsub').enabled, false);
+});
+
+test('buildOpenSubtitlesStreamUrl: preserves existing Stremio v3 URL shape', () => {
+  const url = buildOpenSubtitlesStreamUrl({
+    imdbId: 'tt1234567',
+    type: 'series',
+    season: 2,
+    episode: 5,
+    videoParams: {
+      filename: 'Example Release.mkv',
+      videoHash: 'abc123',
+      videoSize: '999'
+    }
+  });
+
+  assert.strictEqual(
+    url,
+    'https://opensubtitles-v3.strem.io/subtitles/series/tt1234567:2:5/filename=Example%20Release.mkv&videoSize=999&videoHash=abc123.json'
+  );
+});
+
+test('buildWyzieSearchUrl: builds optional IMDb search with language and file hints', () => {
+  const url = buildWyzieSearchUrl({
+    imdbId: '7654321',
+    type: 'series',
+    season: 1,
+    episode: 3,
+    languages: ['eng', 'tur'],
+    videoParams: { filename: 'Show.S01E03.WEB-DL.mkv' },
+    env: { WYZIE_API_KEY: 'wyzie-test-key' }
+  });
+  const parsed = new URL(url);
+
+  assert.strictEqual(`${parsed.origin}${parsed.pathname}`, 'https://sub.wyzie.io/search');
+  assert.strictEqual(parsed.searchParams.get('id'), 'tt7654321');
+  assert.strictEqual(parsed.searchParams.get('season'), '1');
+  assert.strictEqual(parsed.searchParams.get('episode'), '3');
+  assert.strictEqual(parsed.searchParams.get('language'), 'en,tr');
+  assert.strictEqual(parsed.searchParams.get('format'), 'srt');
+  assert.strictEqual(parsed.searchParams.get('source'), DEFAULT_WYZIE_SOURCES);
+  assert.strictEqual(parsed.searchParams.get('file'), 'Show.S01E03.WEB-DL.mkv');
+  assert.strictEqual(parsed.searchParams.get('key'), 'wyzie-test-key');
+});
+
+test('normalizeWyzieSubtitle: maps Wyzie rows into matcher-compatible subtitles', () => {
+  const sub = normalizeWyzieSubtitle({
+    id: '1955024019',
+    url: 'https://sub.wyzie.io/c/example/id/1955024019?format=srt',
+    encoding: 'UTF-8',
+    language: 'en',
+    source: 'podnapisi',
+    release: 'Example.Show.S01E03.1080p.WEB-DL',
+    downloadCount: 42,
+    fileName: 'example.show.s01e03.srt'
+  });
+
+  assert.strictEqual(sub.id, 'wyzie-podnapisi-1955024019');
+  assert.strictEqual(sub.lang, 'eng');
+  assert.strictEqual(sub.g, 'example.show.s01e03.1080p.web.dl');
+  assert.strictEqual(sub.downloads, 42);
+  assert.strictEqual(sub._sourceId, 'wyzie');
+  assert.strictEqual(sub._providerId, 'podnapisi');
+});
+
+test('subtitleSources helpers: normalize language and release keys', () => {
+  assert.strictEqual(toOpenSubtitlesLanguageCode('tr'), 'tur');
+  assert.strictEqual(toOpenSubtitlesLanguageCode('pt-BR'), 'pob');
+  assert.strictEqual(releaseToGroupKey('Movie 2020 1080p WEB-DL'), 'movie.2020.1080p.web.dl');
+});
+
+// ============================================================================
 // RESULTS
 // ============================================================================
 console.log('\n========================================');

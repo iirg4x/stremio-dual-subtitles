@@ -35,7 +35,7 @@ A Stremio addon that displays **two subtitle languages simultaneously** - design
 
 ![Dual Subtitles in Action](public/demo.png)
 
-*Primary language on top in bold, secondary below with a marker and (where the player supports SRT styling) italic and a softer color. Actual appearance depends on the Stremio client.*
+*Primary language on top in bold, secondary below with italic and a softer color where the player supports SRT styling. Actual appearance depends on the Stremio client.*
 
 **Live Instance:** [stremio-dual-subtitles.vercel.app](https://stremio-dual-subtitles.vercel.app)
 
@@ -45,8 +45,8 @@ A Stremio addon that displays **two subtitle languages simultaneously** - design
 
 | Feature | Description |
 |---------|-------------|
-| **Dual Display** | Two languages at once - primary line emphasized, second line with a visible marker and softer styling where supported |
-| **70+ Languages** | Full OpenSubtitles language support including rare languages |
+| **Dual Display** | Two languages at once - primary line emphasized, second line with softer styling where supported |
+| **70+ Languages** | Full OpenSubtitles language support, plus optional extra source adapters |
 | **Smart Sync** | Intelligent time-based subtitle merging algorithm |
 | **Encoding Support** | UTF-8, UTF-16, Windows codepages, ISO-8859 variants |
 | **No Registration** | Works instantly without API keys or accounts |
@@ -201,7 +201,7 @@ sudo ufw allow 7000
 
 **Recommended Setup:**
 1. Set the language you're **learning** as the **Primary Language** (displayed on top)
-2. Set your **native language** as the **Secondary Language** (shown on the second line with a marker and softer styling where the player supports it)
+2. Set your **native language** as the **Secondary Language** (shown on the second line with softer styling where the player supports it)
 3. This way, you try to read and understand the primary language first, then verify with your native language
 
 **Learning Tips:**
@@ -241,7 +241,7 @@ sudo ufw allow 7000
 ```
 stremio-dual-subtitles/
 ├── addon.js              # Core addon logic
-│                         # - Subtitle fetching from OpenSubtitles
+│                         # - Subtitle fetching from enabled sources
 │                         # - SRT parsing and merging algorithm
 │                         # - Dynamic subtitle generation
 │
@@ -293,7 +293,7 @@ stremio-dual-subtitles/
 ```
 1. Request received (movie/series ID + language config)
          ↓
-2. Fetch available subtitles from OpenSubtitles API
+2. Fetch available subtitles from enabled source adapters
          ↓
 3. Filter by selected languages
          ↓
@@ -310,13 +310,30 @@ stremio-dual-subtitles/
 9. Return to Stremio player
 ```
 
+### Subtitle Sources
+
+OpenSubtitles remains enabled by default because it already returns IMDb/file-aware subtitle results that match Stremio requests. The addon also registers the requested source candidates so adapters can be added without changing the matching pipeline.
+
+| Source | Status | Notes |
+|--------|--------|-------|
+| OpenSubtitles | Enabled | Default Stremio subtitle source |
+| Wyzie Subs | Optional | Set `WYZIE_API_KEY` to query extra IMDb-based sources |
+| Podnapisi.net | Optional via Wyzie | Included in the default `WYZIE_SOURCES=podnapisi,yify` |
+| YIFY/YTS subtitles | Optional via Wyzie | Included as the Wyzie `yify` source; movies only |
+| Addic7ed | Registered candidate | Needs a show-id adapter before it can serve Stremio IMDb requests |
+| TVsubtitles.net | Registered candidate | Needs a show/season/episode adapter |
+| DownSub | Registered candidate | Extracts captions from video URLs, not IMDb media IDs |
+| Amara | Registered candidate | Needs Amara video-id mapping |
+| SubtitleCat | Registered candidate | Needs a direct subtitle-file adapter |
+| SubtitleBot | Registered candidate | Search/translation product; no addon adapter yet |
+
 ### Merging Algorithm
 
 The addon uses a time-based matching algorithm:
 
 1. For each primary subtitle entry, find overlapping secondary entries
 2. Match based on start/end time proximity (within 1 second tolerance)
-3. Combine matched entries: primary line uses `<b>`, secondary line uses a `›` prefix plus `<i>` and a muted `<font color>` when the player renders HTML in SRT
+3. Combine matched entries: primary line uses `<b>`, secondary line uses `<i>` and a muted `<font color>` when the player renders HTML in SRT
 4. Handle edge cases: missing translations, timing gaps
 
 ### Supported Encodings
@@ -384,7 +401,7 @@ curl "https://stremio-dual-subtitles.vercel.app/English%20%5Beng%5D%7CTurkish%20
 | Subtitle list | 500ms-2s | <5s |
 | Subtitle file | 200ms-1s | <3s |
 
-*Note: Subtitle operations involve external API calls to OpenSubtitles.*
+*Note: Subtitle operations involve external API calls to enabled subtitle sources.*
 
 ### Optimization Features
 
@@ -413,13 +430,13 @@ A: Yes, completely free and open source. No premium features or hidden costs.
 A: No. The addon works without any registration or API keys.
 
 **Q: Does this work with all movies and series?**
-A: It works with any content that has subtitles available on OpenSubtitles. Popular content has better coverage.
+A: It works with any content that has subtitles available from the enabled subtitle sources. Popular content has better coverage.
 
 **Q: Can I use this on my TV?**
 A: Yes. Install Stremio on your TV, then add the addon using the manifest URL or by setting up network access from your computer.
 
 **Q: Why are some subtitles missing translations?**
-A: If OpenSubtitles doesn't have subtitles for your chosen language pair for that specific content, no dual subtitles will be available.
+A: If the enabled sources do not have subtitles for your chosen language pair for that specific content, no dual subtitles will be available.
 
 **Q: Is my data collected?**
 A: No personal data is collected. Anonymous usage statistics (page views, language preferences) may be tracked for analytics purposes only.
@@ -487,7 +504,7 @@ A: Open an issue on [GitHub](https://github.com/ummugulsunn/stremio-dual-subtitl
 ### Known Limitations
 
 - Requires internet connection for subtitle fetching
-- Dependent on OpenSubtitles availability
+- Dependent on enabled subtitle source availability
 - Serverless (Vercel) has 10-second timeout limit
 - In-memory cache doesn't persist across serverless invocations
 
@@ -634,6 +651,7 @@ SOFTWARE.
 
 **Subtitle Source:**
 - [OpenSubtitles](https://www.opensubtitles.org/)
+- [Wyzie Subs](https://sub.wyzie.io/) (optional, when configured)
 
 **Inspired by:**
 - [Strelingo Addon](https://github.com/Serkali-sudo/strelingo-addon)
