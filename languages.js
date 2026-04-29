@@ -176,12 +176,13 @@ function extractBrowserLanguage(acceptLanguageHeader) {
 function parseLangCode(lang) {
   if (!lang) return lang;
   
-  const match = lang.match(/\[([^\]]+)\]$/);
+  const normalized = String(lang).trim();
+  const match = normalized.match(/\[([^\]]+)\]$/);
   if (match) {
-    return match[1];
+    return match[1].trim().toLowerCase();
   }
   
-  return lang;
+  return normalized.toLowerCase();
 }
 
 /**

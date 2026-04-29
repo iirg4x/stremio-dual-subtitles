@@ -17,44 +17,59 @@ function parseSrtSimple(srtText) {
   const lines = srtText.trim().split('\n');
   const subtitles = [];
   let current = null;
+  let pendingId = null;
+
+  function pushCurrent() {
+    if (current && current.startTime && current.endTime && current.text.trim()) {
+      subtitles.push(current);
+    }
+    current = null;
+  }
   
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+    const timing = parseTimestampLine(line);
     
     // Skip empty lines
     if (!line) {
-      if (current && current.text) {
-        subtitles.push(current);
-        current = null;
-      }
+      pushCurrent();
+      pendingId = null;
+      continue;
+    }
+
+    if (timing) {
+      pushCurrent();
+      current = {
+        id: pendingId || String(subtitles.length + 1),
+        startTime: timing.startTime,
+        endTime: timing.endTime,
+        text: ''
+      };
+      pendingId = null;
       continue;
     }
     
-    // Check if it's a sequence number
-    if (!current && /^\d+$/.test(line)) {
-      current = { id: line, text: '' };
+    // Cue IDs are optional in the wild. Treat a line right before a timestamp
+    // as an ID, even if it is not numeric (VTT commonly uses named IDs).
+    const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+    if (parseTimestampLine(nextLine)) {
+      if (current) pushCurrent();
+      pendingId = line;
       continue;
     }
-    
-    // Check if it's a timestamp line
-    if (current && !current.startTime && line.includes('-->')) {
-      const [start, end] = line.split('-->').map(s => s.trim());
-      current.startTime = start;
-      current.endTime = end;
+
+    // Before the first timing line, any other preamble/garbage is ignored.
+    if (!current) {
       continue;
     }
     
     // Otherwise it's text
-    if (current && current.startTime) {
-      if (current.text) current.text += '\n';
-      current.text += line;
-    }
+    if (current.text) current.text += '\n';
+    current.text += line;
   }
   
   // Add last subtitle if exists
-  if (current && current.text) {
-    subtitles.push(current);
-  }
+  pushCurrent();
   
   return subtitles;
 }
@@ -97,6 +112,7 @@ const QUALITY_GATE_THRESHOLD = 0.85;
 // is enough to cover (best same-group, zipped-popularity, runner-up)
 // while keeping the serverless cold path bounded.
 const MAX_PAIR_ATTEMPTS = 3;
+const VIDEO_PARAM_KEYS = ['filename', 'videoSize', 'videoHash'];
 
 // Configuration
 const ADDON_NAME = process.env.ADDON_NAME || 'Dual Subtitles';
@@ -170,9 +186,10 @@ async function fetchAllSubtitles(imdbId, type, season = null, episode = null, vi
 
   // Add query params for better matching
   const queryParams = [];
-  if (videoParams.filename) queryParams.push(`filename=${encodeURIComponent(videoParams.filename)}`);
-  if (videoParams.videoSize) queryParams.push(`videoSize=${videoParams.videoSize}`);
-  if (videoParams.videoHash) queryParams.push(`videoHash=${videoParams.videoHash}`);
+  const normalizedVideoParams = normalizeVideoParams(videoParams);
+  if (normalizedVideoParams.filename) queryParams.push(`filename=${encodeURIComponent(normalizedVideoParams.filename)}`);
+  if (normalizedVideoParams.videoSize) queryParams.push(`videoSize=${encodeURIComponent(normalizedVideoParams.videoSize)}`);
+  if (normalizedVideoParams.videoHash) queryParams.push(`videoHash=${encodeURIComponent(normalizedVideoParams.videoHash)}`);
   
   if (queryParams.length > 0) {
     apiUrl += `/${queryParams.join('&')}`;
@@ -272,6 +289,68 @@ function parseTimeToMs(timeString) {
   return (hours * 3600 + minutes * 60 + seconds) * 1000 + milliseconds;
 }
 
+function normalizeVideoParams(params = {}) {
+  const normalized = {};
+  for (const key of VIDEO_PARAM_KEYS) {
+    const value = params && params[key];
+    if (Array.isArray(value)) {
+      if (value.length > 0 && value[0] != null && String(value[0]).trim() !== '') {
+        normalized[key] = String(value[0]).trim();
+      }
+    } else if (value != null && String(value).trim() !== '') {
+      normalized[key] = String(value).trim();
+    }
+  }
+  return normalized;
+}
+
+function serializeVideoParams(params = {}) {
+  const normalized = normalizeVideoParams(params);
+  const search = new URLSearchParams();
+  for (const key of VIDEO_PARAM_KEYS) {
+    if (normalized[key]) search.set(key, normalized[key]);
+  }
+  return search.toString();
+}
+
+function videoParamsCacheFragment(params = {}) {
+  const serialized = serializeVideoParams(params);
+  return serialized ? `_${serialized}` : '';
+}
+
+function buildDynamicSubtitleUrl(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams = {}) {
+  const dynamicParams = [
+    type,
+    imdbId,
+    season || '0',
+    episode || '0',
+    mainLang,
+    transLang,
+    mainSubId,
+    transSubId
+  ].join('/');
+
+  const query = serializeVideoParams(videoParams);
+  return `{{ADDON_URL}}/subs/${dynamicParams}.srt${query ? `?${query}` : ''}`;
+}
+
+/**
+ * Extract and normalize an SRT/VTT timestamp line.
+ * Drops cue-position metadata so generated SRT timestamps stay valid.
+ */
+function parseTimestampLine(line) {
+  if (!line || !line.includes('-->')) return null;
+
+  const timePattern = '(\\d{1,2}:\\d{2}:\\d{2}[,.]\\d{1,3})';
+  const match = line.match(new RegExp(`^\\s*${timePattern}\\s*-->\\s*${timePattern}`));
+  if (!match) return null;
+
+  return {
+    startTime: msToSrtTime(parseTimeToMs(match[1])),
+    endTime: msToSrtTime(parseTimeToMs(match[2]))
+  };
+}
+
 /**
  * Normalize VTT content to SRT-compatible format.
  * Strips WEBVTT header, style blocks, and adds numeric cue IDs if missing.
@@ -280,47 +359,43 @@ function normalizeVttToSrt(text) {
   const lines = text.split('\n');
   const output = [];
   let cueIndex = 0;
-  let inHeader = true;
-  let inStyleBlock = false;
-  let expectTimestamp = false;
+  let inBlock = false;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
 
-    if (inHeader) {
-      if (line === '' || line.startsWith('WEBVTT') || line.startsWith('Kind:') ||
-          line.startsWith('Language:') || line.startsWith('NOTE')) {
-        continue;
-      }
-      inHeader = false;
-    }
-
-    if (line.startsWith('STYLE') || line.startsWith('::cue')) {
-      inStyleBlock = true;
-      continue;
-    }
-    if (inStyleBlock) {
-      if (line === '') inStyleBlock = false;
+    if (inBlock) {
+      if (line === '') inBlock = false;
       continue;
     }
 
-    if (line.includes('-->')) {
+    if (line === '' || line.startsWith('WEBVTT') ||
+        /^Kind:/i.test(line) || /^Language:/i.test(line) ||
+        /^X-TIMESTAMP-MAP:/i.test(line)) {
+      continue;
+    }
+
+    if (/^(STYLE|REGION|NOTE)(\s|$)/i.test(line) || /^::cue/i.test(line)) {
+      inBlock = true;
+      continue;
+    }
+
+    const timing = parseTimestampLine(line);
+    if (timing) {
       cueIndex++;
-      const normalized = line.replace(/\./g, ',');
       output.push('');
       output.push(String(cueIndex));
-      output.push(normalized);
-      expectTimestamp = false;
+      output.push(`${timing.startTime} --> ${timing.endTime}`);
       continue;
     }
 
-    // Skip VTT numeric cue identifiers (a number line right before a timestamp)
-    if (/^\d+$/.test(line) && i + 1 < lines.length && lines[i + 1].includes('-->')) {
+    // Skip VTT cue identifiers (numeric or named) right before a timestamp.
+    const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+    if (parseTimestampLine(nextLine)) {
       continue;
     }
 
     output.push(line);
-    expectTimestamp = false;
   }
 
   return output.join('\n');
@@ -715,11 +790,7 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
   try {
     // Video params for better matching
-    const videoParams = {
-      filename: extra?.filename,
-      videoSize: extra?.videoSize,
-      videoHash: extra?.videoHash
-    };
+    const videoParams = normalizeVideoParams(extra || {});
 
     // Fetch all subtitles
     debugServer.log('Fetching subtitles from OpenSubtitles...');
@@ -754,20 +825,19 @@ async function subtitlesHandler({ type, id, extra, config }) {
     // code ran the entire pipeline twice (once here for nothing).
     const best = candidatePairs[0];
 
-    const dynamicParams = [
-      type,
-      imdbId,
-      season || '0',
-      episode || '0',
-      mainLang,
-      transLang,
-      best.main.id,
-      best.trans.id
-    ].join('/');
-
     const finalSubtitles = [{
       id: `dual-${best.main.id}-${best.trans.id}`,
-      url: `{{ADDON_URL}}/subs/${dynamicParams}.srt`,
+      url: buildDynamicSubtitleUrl(
+        type,
+        imdbId,
+        season,
+        episode,
+        mainLang,
+        transLang,
+        best.main.id,
+        best.trans.id,
+        videoParams
+      ),
       lang: mainLang,
       SubtitlesName:
         `Dual (${mainLang.toUpperCase()}+${transLang.toUpperCase()}) - ` +
@@ -800,10 +870,13 @@ builder.defineSubtitlesHandler(subtitlesHandler);
  * entirely — even ahead of Vercel's edge cache (which ALSO caches via
  * Cache-Control headers in server.js routes).
  */
-async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId) {
+async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams = {}) {
   debugServer.log('Dynamic subtitle generation:', { type, imdbId, mainLang, transLang });
 
-  const cacheKey = `${imdbId}_${season || ''}_${episode || ''}_${mainLang}_${transLang}_${mainSubId}_${transSubId}`;
+  const normalizedVideoParams = normalizeVideoParams(videoParams);
+  const cacheKey =
+    `${imdbId}_${season || ''}_${episode || ''}_${mainLang}_${transLang}_${mainSubId}_${transSubId}` +
+    videoParamsCacheFragment(normalizedVideoParams);
   const cached = getSubtitle(cacheKey);
   if (cached) {
     debugServer.log(`Cache hit (in-instance): ${cacheKey}`);
@@ -816,7 +889,8 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
       imdbId, 
       type, 
       season !== '0' ? season : null, 
-      episode !== '0' ? episode : null
+      episode !== '0' ? episode : null,
+      normalizedVideoParams
     );
 
     if (!allSubtitles) {
@@ -898,6 +972,10 @@ module.exports = {
     joinSubtitleLines,
     formatSrt,
     formatSrtSimple,
-    msToSrtTime
+    msToSrtTime,
+    parseTimestampLine,
+    normalizeVideoParams,
+    serializeVideoParams,
+    buildDynamicSubtitleUrl
   }
 };

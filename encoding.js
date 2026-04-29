@@ -89,7 +89,9 @@ const LANGUAGE_ALIASES = {
  * @returns {string[]} Array of equivalent codes
  */
 function getLanguageAliases(languageCode) {
-  return LANGUAGE_ALIASES[languageCode] || [languageCode];
+  if (!languageCode) return [];
+  const lower = languageCode.toLowerCase();
+  return LANGUAGE_ALIASES[lower] || [lower];
 }
 
 /**
@@ -101,6 +103,10 @@ function normalizeLanguageCode(lang) {
   if (!lang) return null;
   const lower = lang.toLowerCase();
   if (lower.length === 2) return lower;
+  if (lower === 'zh-tw' || lower === 'zh-hant' || lower === 'zh-hk' || lower === 'zh-mo') {
+    return 'zh-tw';
+  }
+  if (lower === 'zh-cn' || lower === 'zh-hans') return 'zh';
   return ISO639_3_TO_1[lower] || null;
 }
 
@@ -179,6 +185,13 @@ function buildCodepageList(languageHint = null) {
     { name: 'win874', desc: 'Windows-874 (Thai)' },
     { name: 'win1258', desc: 'Windows-1258 (Vietnamese)' },
     { name: 'win1257', desc: 'Windows-1257 (Baltic)' },
+    { name: 'iso88591', desc: 'ISO-8859-1 (Western)' },
+    { name: 'iso88592', desc: 'ISO-8859-2 (Central European)' },
+    { name: 'iso88595', desc: 'ISO-8859-5 (Cyrillic)' },
+    { name: 'iso88597', desc: 'ISO-8859-7 (Greek)' },
+    { name: 'iso88598', desc: 'ISO-8859-8 (Hebrew)' },
+    { name: 'iso88599', desc: 'ISO-8859-9 (Turkish)' },
+    { name: 'iso885915', desc: 'ISO-8859-15 (Western)' },
   ];
 
   if (!languageHint) return defaultCodepages;
@@ -197,8 +210,24 @@ function buildCodepageList(languageHint = null) {
     'win1257': 'Windows-1257 (Baltic)',
     'win1258': 'Windows-1258 (Vietnamese)',
     'win874': 'Windows-874 (Thai)',
+    'iso88591': 'ISO-8859-1 (Western)',
+    'iso88592': 'ISO-8859-2 (Central European)',
+    'iso88595': 'ISO-8859-5 (Cyrillic)',
+    'iso88596': 'ISO-8859-6 (Arabic)',
+    'iso88597': 'ISO-8859-7 (Greek)',
+    'iso88598': 'ISO-8859-8 (Hebrew)',
+    'iso88599': 'ISO-8859-9 (Turkish)',
+    'iso885915': 'ISO-8859-15 (Western)',
     'koi8-r': 'KOI8-R (Russian)',
     'koi8-u': 'KOI8-U (Ukrainian)',
+    'gbk': 'GBK (Chinese)',
+    'gb2312': 'GB2312 (Chinese)',
+    'big5': 'Big5 (Traditional Chinese)',
+    'shift_jis': 'Shift_JIS (Japanese)',
+    'euc-jp': 'EUC-JP (Japanese)',
+    'euc-kr': 'EUC-KR (Korean)',
+    'cp949': 'CP949 (Korean)',
+    'tis620': 'TIS-620 (Thai)',
   };
 
   const prioritized = [];
@@ -294,11 +323,23 @@ function normalizeEncoding(encoding) {
   if (!encoding) return 'utf8';
 
   const normalized = encoding.toLowerCase();
+  const windowsMatch = normalized.match(/^windows-?125([0-8])$/);
+  if (windowsMatch) return `win125${windowsMatch[1]}`;
+
+  const isoMatch = normalized.match(/^iso-?8859-?(\d{1,2})$/);
+  if (isoMatch) return `iso8859${isoMatch[1]}`;
+
   switch (normalized) {
     case 'windows-1254': return 'win1254';
     case 'windows-1251': return 'win1251';
     case 'windows-1252': return 'win1252';
+    case 'windows-874': return 'win874';
     case 'iso-8859-9': return 'iso88599';
+    case 'shift-jis': return 'shift_jis';
+    case 'shift_jis': return 'shift_jis';
+    case 'euc-kr': return 'euc-kr';
+    case 'euc-jp': return 'euc-jp';
+    case 'gb18030': return 'gb18030';
     case 'utf-16le': return 'utf16le';
     case 'utf-16be': return 'utf16be';
     case 'ascii':
@@ -311,6 +352,76 @@ function normalizeEncoding(encoding) {
       }
       return 'utf8';
   }
+}
+
+function decodeWithEncoding(buffer, encoding) {
+  if (encoding === 'utf8') return buffer.toString('utf8');
+  return iconv.decode(buffer, encoding);
+}
+
+function decodingQualityScore(text) {
+  if (!text) return 0;
+  let score = 0;
+  const replacements = (text.match(/\uFFFD/g) || []).length;
+  score += replacements * 100;
+
+  // Penalize control characters that should not appear in plain subtitles.
+  const controls = (text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) || []).length;
+  score += controls * 20;
+
+  // Common mojibake markers from UTF-8 decoded through a single-byte codepage.
+  const mojibake = (text.match(/[ÃÂÐÑØÙÝÞðþ]/g) || []).length;
+  score += mojibake * 2;
+  return score;
+}
+
+function uniqueEncodings(encodings) {
+  const seen = new Set();
+  const result = [];
+  for (const encoding of encodings) {
+    if (!encoding) continue;
+    const normalized = normalizeEncoding(encoding);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function decodeBestEffort(buffer, detectedEncoding, languageHint = null) {
+  const langCode = normalizeLanguageCode(languageHint);
+  const utf8Text = buffer.toString('utf8');
+
+  // Valid UTF-8 is the safest answer; decoding it as a legacy codepage often
+  // produces plausible-looking mojibake with no replacement characters.
+  if (decodingQualityScore(utf8Text) === 0) {
+    return utf8Text;
+  }
+
+  const languageCodepages = buildCodepageList(langCode).map(cp => cp.name);
+  const candidates = uniqueEncodings([
+    ...languageCodepages,
+    detectedEncoding,
+    'utf8'
+  ]);
+
+  let bestText = utf8Text;
+  let bestScore = decodingQualityScore(utf8Text);
+
+  for (const encoding of candidates) {
+    try {
+      const decoded = decodeWithEncoding(buffer, encoding);
+      const score = decodingQualityScore(decoded);
+      if (score < bestScore) {
+        bestScore = score;
+        bestText = decoded;
+      }
+    } catch (e) {
+      // Unsupported encoding alias; try the next candidate.
+    }
+  }
+
+  return bestText;
 }
 
 /**
@@ -353,20 +464,11 @@ function decodeSubtitleBuffer(buffer, languageHint = null) {
     const sample = buffer.slice(0, Math.min(buffer.length, CHARDET_SAMPLE_SIZE));
     const detectedEncoding = chardet.detect(sample);
     const encoding = normalizeEncoding(detectedEncoding);
-
-    if (encoding !== 'utf8') {
-      try {
-        subtitleText = iconv.decode(buffer, encoding);
-      } catch (e) {
-        subtitleText = buffer.toString('utf8');
-      }
-    } else {
-      subtitleText = buffer.toString('utf8');
-    }
+    subtitleText = decodeBestEffort(buffer, encoding, languageHint);
   }
 
   // Apply text-level encoding fixes
-  subtitleText = fixCharacterEncodings(subtitleText, langCode);
+  subtitleText = fixCharacterEncodings(subtitleText, languageHint || langCode);
 
   // Strip any remaining BOM
   if (subtitleText.startsWith('\uFEFF')) {

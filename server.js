@@ -282,12 +282,17 @@ app.get('/subtitles/:filename', (req, res) => {
 // URL format: /subs/:type/:imdbId/:season/:episode/:mainLang/:transLang/:mainSubId/:transSubId.srt
 app.get('/subs/:type/:imdbId/:season/:episode/:mainLang/:transLang/:mainSubId/:transSubId.srt', async (req, res) => {
   const { type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId } = req.params;
+  const videoParams = {
+    filename: req.query.filename,
+    videoSize: req.query.videoSize,
+    videoHash: req.query.videoHash
+  };
   
   debugServer.log(`Dynamic subtitle request: ${type}/${imdbId} ${mainLang}+${transLang}`);
   
   try {
     const content = await generateDynamicSubtitle(
-      type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId
+      type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams
     );
     
     if (!content) {
@@ -398,27 +403,19 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
 // Parse extra parameters from URL
 function parseExtra(extraStr) {
   const extra = {};
+  if (!extraStr) return extra;
   
-  // Handle the format: videoHash.videoSize.filename or just extra params
-  const parts = extraStr.split('.');
-  
-  // Try to parse as key=value pairs
-  for (const part of parts) {
-    if (part.includes('=')) {
-      const [key, value] = part.split('=');
-      extra[key] = value;
-    }
-  }
-  
-  // Also handle query-style params
-  if (extraStr.includes('&')) {
-    const params = extraStr.split('&');
-    for (const param of params) {
-      if (param.includes('=')) {
-        const [key, value] = param.split('=');
-        extra[key] = decodeURIComponent(value);
-      }
-    }
+  // Stremio addon extras are query-string shaped, but they arrive as a path
+  // segment. Preserve dots inside filenames while still tolerating older
+  // dotted key=value separators.
+  const normalized = extraStr.replace(
+    /\.(?=(?:videoHash|videoSize|filename|imdbId|season|episode)=)/g,
+    '&'
+  );
+
+  const params = new URLSearchParams(normalized);
+  for (const [key, value] of params) {
+    if (key) extra[key] = value;
   }
   
   return extra;
@@ -470,3 +467,4 @@ if (!process.env.VERCEL) {
 
 // Export for Vercel
 module.exports = app;
+module.exports._test = { parseExtra };
