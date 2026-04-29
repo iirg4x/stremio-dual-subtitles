@@ -100,12 +100,16 @@ const {
   getLanguageName
 } = require('./languages');
 const { alignAndMatch } = require('./lib/syncEngine');
-const { generateCandidatePairs } = require('./lib/sourceSelection');
+const { generateCandidatePairs, rankCandidatesForLanguage } = require('./lib/sourceSelection');
 const {
   fetchSubtitlesFromEnabledSources,
   getEnabledSubtitleSources,
   getSubtitleSourceSummary
 } = require('./lib/subtitleSources');
+const {
+  isTranslationConfigured,
+  translateTexts
+} = require('./lib/translation');
 
 // Match rate at or above this is considered "good enough" — we stop
 // trying further candidate pairs. Empirically high-quality matches land
@@ -119,6 +123,7 @@ const QUALITY_GATE_THRESHOLD = 0.85;
 const MAX_PAIR_ATTEMPTS = 3;
 const VIDEO_PARAM_KEYS = ['filename', 'videoSize', 'videoHash'];
 const TIMING_SOURCES = new Set(['primary', 'secondary']);
+const SUBTITLE_MODES = new Set(['dual', 'translate-primary']);
 
 // Configuration
 const ADDON_NAME = process.env.ADDON_NAME || 'Dual Subtitles';
@@ -329,6 +334,10 @@ function normalizeTimingSource(timingSource) {
   return TIMING_SOURCES.has(timingSource) ? timingSource : 'primary';
 }
 
+function normalizeSubtitleMode(mode) {
+  return SUBTITLE_MODES.has(mode) ? mode : 'dual';
+}
+
 function videoParamsCacheFragment(params = {}) {
   const serialized = serializeVideoParams(params);
   return serialized ? `_${serialized}` : '';
@@ -348,7 +357,9 @@ function buildDynamicSubtitleUrl(type, imdbId, season, episode, mainLang, transL
 
   const search = new URLSearchParams(serializeVideoParams(videoParams));
   const timingSource = normalizeTimingSource(options.timingSource);
+  const subtitleMode = normalizeSubtitleMode(options.mode || options.subtitleMode);
   if (timingSource !== 'primary') search.set('timingSource', timingSource);
+  if (subtitleMode !== 'dual') search.set('mode', subtitleMode);
   const query = search.toString();
   return `{{ADDON_URL}}/subs/${dynamicParams}.srt${query ? `?${query}` : ''}`;
 }
@@ -807,6 +818,79 @@ async function selectAndMergeBestPair(candidatePairs, mainLang, transLang, optio
   return best;
 }
 
+async function translatePrimarySubtitleEntries(mainParsed, mainLang, transLang, options = {}) {
+  const sourceTexts = [];
+  const sourceIndexes = [];
+
+  for (let i = 0; i < mainParsed.length; i++) {
+    const cleanText = cleanSubtitleText(mainParsed[i].text, mainLang);
+    if (!cleanText) continue;
+    sourceIndexes.push(i);
+    sourceTexts.push(cleanText);
+  }
+
+  if (sourceTexts.length === 0) return [];
+
+  const translatedTexts = await translateTexts(sourceTexts, {
+    sourceLang: mainLang,
+    targetLang: transLang,
+    env: options.env || process.env,
+    request: options.translationRequest,
+    timeout: options.translationTimeout
+  });
+
+  const translatedByIndex = new Map();
+  for (let i = 0; i < sourceIndexes.length; i++) {
+    translatedByIndex.set(sourceIndexes[i], translatedTexts[i] || '');
+  }
+
+  return mainParsed.map((sub, index) => ({
+    ...sub,
+    text: translatedByIndex.get(index) || ''
+  }));
+}
+
+async function generateTranslatedPrimarySubtitle(mainSub, mainLang, transLang, options = {}) {
+  if (!isTranslationConfigured(options.env || process.env)) {
+    debugServer.warn('Machine translation requested but translation is not configured');
+    return null;
+  }
+
+  const content = await fetchSubtitleContent(mainSub.url, mainLang);
+  const mainParsed = content ? parseSrt(content) : null;
+  if (!mainParsed || mainParsed.length === 0) {
+    debugServer.warn(`Primary subtitle ${mainSub.id} unparsable for translation`);
+    return null;
+  }
+
+  const translatedSubs = await translatePrimarySubtitleEntries(mainParsed, mainLang, transLang, options);
+  if (!translatedSubs || translatedSubs.length === 0) {
+    debugServer.warn(`Primary subtitle ${mainSub.id} produced no translatable text`);
+    return null;
+  }
+
+  const merged = mergeSubtitles(mainParsed, translatedSubs, {
+    mainLang,
+    transLang,
+    timingSource: 'primary',
+    allowMultiTrans: false,
+    enableOffset: false,
+    enableDrift: false
+  });
+
+  if (!merged || merged.length === 0) return null;
+
+  return {
+    merged,
+    mergedSrt: formatSrt(merged),
+    matchRate: merged.matchRate != null ? merged.matchRate : 1,
+    mainSub,
+    transSub: null,
+    attempts: 1,
+    passedGate: true
+  };
+}
+
 // Subtitle handler function
 async function subtitlesHandler({ type, id, extra, config }) {
   debugServer.log('Subtitle request:', sanitizeForLogging({ type, id }));
@@ -869,15 +953,16 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
     debugServer.log(`Found ${allSubtitles.length} total subtitles`);
 
+    const mainCandidates = rankCandidatesForLanguage(allSubtitles, mainLang);
+    if (mainCandidates.length === 0) {
+      debugServer.warn(`No ${mainLang} subtitle candidates available`);
+      return { subtitles: [] };
+    }
+
     // Build the ordered list of (main, trans) candidates. Same-`g`
     // (same release) pairs come first; this is our biggest single
     // accuracy win on titles like Sopranos S01E03.
     const candidatePairs = generateCandidatePairs(allSubtitles, mainLang, transLang);
-
-    if (candidatePairs.length === 0) {
-      debugServer.warn(`No ${mainLang}/${transLang} candidate pairs available`);
-      return { subtitles: [] };
-    }
 
     debugServer.log(
       `Built ${candidatePairs.length} candidate pair(s); ` +
@@ -886,53 +971,79 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
     // CPU-cheap path: do NOT fetch / parse / merge here. Just publish
     // the URL of the best-ranked pair. The actual download + alignment
-    // happens once, on demand, when Stremio fetches the .srt URL. This
-    // halves Vercel Active CPU per dual-subtitle request, since the old
-    // code ran the entire pipeline twice (once here for nothing).
-    const best = candidatePairs[0];
-
+    // happens once, on demand, when Stremio fetches the .srt URL.
     const subtitleTitle =
       `Dual (${mainLang.toUpperCase()}+${transLang.toUpperCase()}) - ` +
       `${getLanguageName(mainLang)} + ${getLanguageName(transLang)}`;
 
-    const finalSubtitles = [{
-      id: `dual-${best.main.id}-${best.trans.id}-primary-time`,
-      url: buildDynamicSubtitleUrl(
-        type,
-        imdbId,
-        season,
-        episode,
-        mainLang,
-        transLang,
-        best.main.id,
-        best.trans.id,
-        videoParams,
-        { timingSource: 'primary' }
-      ),
-      lang: mainLang,
-      SubtitlesName: `${subtitleTitle} (Primary timing)`
-    }, {
-      id: `dual-${best.main.id}-${best.trans.id}-secondary-time`,
-      url: buildDynamicSubtitleUrl(
-        type,
-        imdbId,
-        season,
-        episode,
-        mainLang,
-        transLang,
-        best.main.id,
-        best.trans.id,
-        videoParams,
-        { timingSource: 'secondary' }
-      ),
-      lang: mainLang,
-      SubtitlesName: `${subtitleTitle} (Secondary timing)`
-    }];
+    const finalSubtitles = [];
+    const best = candidatePairs[0];
 
-    debugServer.log(
-      `Selected pair (no merge): main=${best.main.id} trans=${best.trans.id} ` +
-      `source=${best.source} sameGroup=${best.sameGroup}`
-    );
+    if (best) {
+      finalSubtitles.push({
+        id: `dual-${best.main.id}-${best.trans.id}-primary-time`,
+        url: buildDynamicSubtitleUrl(
+          type,
+          imdbId,
+          season,
+          episode,
+          mainLang,
+          transLang,
+          best.main.id,
+          best.trans.id,
+          videoParams,
+          { timingSource: 'primary' }
+        ),
+        lang: mainLang,
+        SubtitlesName: `${subtitleTitle} (Primary timing)`
+      }, {
+        id: `dual-${best.main.id}-${best.trans.id}-secondary-time`,
+        url: buildDynamicSubtitleUrl(
+          type,
+          imdbId,
+          season,
+          episode,
+          mainLang,
+          transLang,
+          best.main.id,
+          best.trans.id,
+          videoParams,
+          { timingSource: 'secondary' }
+        ),
+        lang: mainLang,
+        SubtitlesName: `${subtitleTitle} (Secondary timing)`
+      });
+
+      debugServer.log(
+        `Selected pair (no merge): main=${best.main.id} trans=${best.trans.id} ` +
+        `source=${best.source} sameGroup=${best.sameGroup}`
+      );
+    } else {
+      debugServer.warn(`No ${mainLang}/${transLang} candidate pairs available`);
+    }
+
+    if (isTranslationConfigured()) {
+      const bestMain = best ? best.main : mainCandidates[0];
+      finalSubtitles.push({
+        id: `dual-${bestMain.id}-translate-primary`,
+        url: buildDynamicSubtitleUrl(
+          type,
+          imdbId,
+          season,
+          episode,
+          mainLang,
+          transLang,
+          bestMain.id,
+          'translated',
+          videoParams,
+          { mode: 'translate-primary' }
+        ),
+        lang: mainLang,
+        SubtitlesName: `${subtitleTitle} (Translate primary)`
+      });
+    }
+
+    if (finalSubtitles.length === 0) return { subtitles: [] };
 
     return {
       subtitles: finalSubtitles,
@@ -960,10 +1071,11 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
 
   const normalizedVideoParams = normalizeVideoParams(videoParams);
   const timingSource = normalizeTimingSource(options.timingSource);
+  const subtitleMode = normalizeSubtitleMode(options.mode || options.subtitleMode);
   const cacheKey =
     `${imdbId}_${season || ''}_${episode || ''}_${mainLang}_${transLang}_${mainSubId}_${transSubId}` +
     videoParamsCacheFragment(normalizedVideoParams) +
-    `_timing_${timingSource}`;
+    `_mode_${subtitleMode}_timing_${timingSource}`;
   const cached = getSubtitle(cacheKey);
   if (cached) {
     debugServer.log(`Cache hit (in-instance): ${cacheKey}`);
@@ -978,12 +1090,33 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
       season !== '0' ? season : null, 
       episode !== '0' ? episode : null,
       normalizedVideoParams,
-      { languages: [mainLang, transLang] }
+      { languages: subtitleMode === 'translate-primary' ? [mainLang] : [mainLang, transLang] }
     );
 
     if (!allSubtitles) {
       debugServer.warn('No subtitles found');
       return null;
+    }
+
+    if (subtitleMode === 'translate-primary') {
+      const requestedMain = allSubtitles.find(s => String(s.id) === String(mainSubId));
+      const mainSub = requestedMain || rankCandidatesForLanguage(allSubtitles, mainLang)[0];
+      if (!mainSub) {
+        debugServer.warn('No primary subtitle available for translation');
+        return null;
+      }
+
+      const translated = await generateTranslatedPrimarySubtitle(mainSub, mainLang, transLang, options);
+      if (!translated || !translated.mergedSrt) {
+        debugServer.warn('Could not generate translated-primary subtitle');
+        return null;
+      }
+
+      debugServer.log(
+        `Generated ${translated.merged.length} translated-primary subtitle entries`
+      );
+      storeSubtitle(cacheKey, translated.mergedSrt);
+      return translated.mergedSrt;
     }
 
     // Build candidate pairs for this title; we'll start by trying the
@@ -1066,9 +1199,11 @@ module.exports = {
     serializeVideoParams,
     buildDynamicSubtitleUrl,
     normalizeTimingSource,
+    normalizeSubtitleMode,
     fetchAllSubtitles,
     getEnabledSubtitleSources,
     getSubtitleSourceSummary,
+    translatePrimarySubtitleEntries,
     decodeSubtitleEntities,
     cleanSubtitleText
   }

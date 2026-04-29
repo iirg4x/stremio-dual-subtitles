@@ -23,6 +23,7 @@ const {
     serializeVideoParams,
     buildDynamicSubtitleUrl,
     normalizeTimingSource,
+    normalizeSubtitleMode,
     decodeSubtitleEntities
   },
   manifest
@@ -542,11 +543,35 @@ test('buildDynamicSubtitleUrl can request secondary subtitle timing', () => {
   assert.ok(url.includes('timingSource=secondary'));
 });
 
+test('buildDynamicSubtitleUrl can request translated-primary mode', () => {
+  const url = buildDynamicSubtitleUrl(
+    'movie',
+    '0111161',
+    '0',
+    '0',
+    'eng',
+    'tur',
+    'main-id',
+    'translated',
+    { filename: 'Movie.2020.mkv' },
+    { mode: 'translate-primary' }
+  );
+  assert.ok(url.includes('filename=Movie.2020.mkv'));
+  assert.ok(url.includes('mode=translate-primary'));
+});
+
 test('normalizeTimingSource rejects unknown values', () => {
   assert.strictEqual(normalizeTimingSource('secondary'), 'secondary');
   assert.strictEqual(normalizeTimingSource('embedded'), 'primary');
   assert.strictEqual(normalizeTimingSource('independent'), 'primary');
   assert.strictEqual(normalizeTimingSource(null), 'primary');
+});
+
+test('normalizeSubtitleMode rejects unknown values', () => {
+  assert.strictEqual(normalizeSubtitleMode('translate-primary'), 'translate-primary');
+  assert.strictEqual(normalizeSubtitleMode('dual'), 'dual');
+  assert.strictEqual(normalizeSubtitleMode('translated'), 'dual');
+  assert.strictEqual(normalizeSubtitleMode(null), 'dual');
 });
 
 test('serializeVideoParams URL-encodes unsafe filename characters', () => {
@@ -1165,6 +1190,77 @@ test('subtitleSources helpers: normalize language and release keys', () => {
   assert.strictEqual(toOpenSubtitlesLanguageCode('tr'), 'tur');
   assert.strictEqual(toOpenSubtitlesLanguageCode('pt-BR'), 'pob');
   assert.strictEqual(releaseToGroupKey('Movie 2020 1080p WEB-DL'), 'movie.2020.1080p.web.dl');
+});
+
+// ============================================================================
+// translation - MyMemory helpers
+// ============================================================================
+console.log('\n--- translation ---');
+
+const {
+  buildMyMemoryUrl,
+  buildMyMemoryRequestUrl,
+  isTranslationConfigured,
+  toTranslationLanguageCode,
+  chunkMyMemoryText,
+  normalizeMyMemoryResponse
+} = require('./lib/translation');
+
+test('translation: MyMemory provider is enabled without a subscription key', () => {
+  assert.strictEqual(isTranslationConfigured({}), true);
+});
+
+test('translation: builds MyMemory request URL', () => {
+  const url = buildMyMemoryRequestUrl({
+    text: 'Hello world',
+    source: 'en',
+    target: 'tr',
+    env: { MYMEMORY_EMAIL: 'dev@example.com' }
+  });
+  const parsed = new URL(url);
+
+  assert.strictEqual(buildMyMemoryUrl({}), 'https://api.mymemory.translated.net/get');
+  assert.strictEqual(`${parsed.origin}${parsed.pathname}`, 'https://api.mymemory.translated.net/get');
+  assert.strictEqual(parsed.searchParams.get('q'), 'Hello world');
+  assert.strictEqual(parsed.searchParams.get('langpair'), 'en|tr');
+  assert.strictEqual(parsed.searchParams.get('mt'), '1');
+  assert.strictEqual(parsed.searchParams.get('de'), 'dev@example.com');
+});
+
+test('translation: maps addon language codes to MyMemory language codes', () => {
+  assert.strictEqual(toTranslationLanguageCode('eng'), 'en');
+  assert.strictEqual(toTranslationLanguageCode('tur'), 'tr');
+  assert.strictEqual(toTranslationLanguageCode('pob'), 'pt');
+  assert.strictEqual(toTranslationLanguageCode('zht'), 'zh-TW');
+});
+
+test('translation: chunks MyMemory text by UTF-8 byte budget', () => {
+  assert.deepStrictEqual(
+    chunkMyMemoryText('aa bb cccc dd', { maxBytes: 4 }),
+    ['aa', 'bb', 'cccc', 'dd']
+  );
+  assert.strictEqual(
+    chunkMyMemoryText('ééé', { maxBytes: 4 }).length,
+    2
+  );
+});
+
+test('translation: normalizes MyMemory response shape', () => {
+  assert.strictEqual(
+    normalizeMyMemoryResponse({
+      responseStatus: 200,
+      responseData: { translatedText: 'Merhaba dunya' }
+    }),
+    'Merhaba dunya'
+  );
+  assert.throws(
+    () => normalizeMyMemoryResponse({ responseStatus: 403, responseDetails: 'quota exceeded' }),
+    /quota exceeded/
+  );
+  assert.throws(
+    () => normalizeMyMemoryResponse({ responseStatus: 200 }),
+    /translatedText/
+  );
 });
 
 // ============================================================================

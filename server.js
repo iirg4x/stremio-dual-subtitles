@@ -288,6 +288,7 @@ app.get('/subs/:type/:imdbId/:season/:episode/:mainLang/:transLang/:mainSubId/:t
     videoHash: req.query.videoHash
   };
   const timingSource = req.query.timingSource;
+  const mode = req.query.mode || req.query.subtitleMode;
   
   debugServer.log(`Dynamic subtitle request: ${type}/${imdbId} ${mainLang}+${transLang}`);
   
@@ -302,7 +303,7 @@ app.get('/subs/:type/:imdbId/:season/:episode/:mainLang/:transLang/:mainSubId/:t
       mainSubId,
       transSubId,
       videoParams,
-      { timingSource }
+      { timingSource, mode }
     );
     
     if (!content) {
