@@ -396,13 +396,9 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
       }));
     }
 
-    // Manifest-style response is essentially deterministic for a given
-    // (config, type, id) for at least an hour — Stremio polls this on
-    // every play and resume, so caching it on Vercel's edge is a major
-    // CPU saving for popular titles. We use a short max-age for the
-    // browser/Stremio (so config changes propagate fast) but a longer
-    // s-maxage on the edge.
-    res.setHeader('Cache-Control', 'public, max-age=600, s-maxage=3600, stale-while-revalidate=21600');
+    // Keep subtitle-list responses fresh while timing variants are changing;
+    // stale lists can leave removed options visible in Stremio.
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     res.json(result);
   } catch (error) {
     debugServer.error('Error handling subtitle request:', sanitizeForLogging(error.message));

@@ -918,7 +918,7 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
     return {
       subtitles: finalSubtitles,
-      cacheMaxAge: 6 * 3600
+      cacheMaxAge: 0
     };
 
   } catch (error) {
