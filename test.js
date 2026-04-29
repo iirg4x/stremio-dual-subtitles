@@ -542,8 +542,25 @@ test('buildDynamicSubtitleUrl can request secondary subtitle timing', () => {
   assert.ok(url.includes('timingSource=secondary'));
 });
 
+test('buildDynamicSubtitleUrl can request independent subtitle timing', () => {
+  const url = buildDynamicSubtitleUrl(
+    'movie',
+    '0111161',
+    '0',
+    '0',
+    'eng',
+    'ara',
+    'main-id',
+    'trans-id',
+    {},
+    { timingSource: 'independent' }
+  );
+  assert.ok(url.includes('timingSource=independent'));
+});
+
 test('normalizeTimingSource rejects unknown values', () => {
   assert.strictEqual(normalizeTimingSource('secondary'), 'secondary');
+  assert.strictEqual(normalizeTimingSource('independent'), 'independent');
   assert.strictEqual(normalizeTimingSource('embedded'), 'primary');
   assert.strictEqual(normalizeTimingSource(null), 'primary');
 });
@@ -829,6 +846,27 @@ test('mergeSubtitles: primary timing remains the default timing source', () => {
   const merged = mergeSubtitles(main, trans, { mainLang: 'eng', transLang: 'ara' });
   assert.strictEqual(merged[0].startTime, '00:00:10,000');
   assert.strictEqual(merged.alignment.timingSource, 'primary');
+});
+
+test('mergeSubtitles: independent timing keeps each language on its own timestamps', () => {
+  const main = [
+    { id: '1', startTime: '00:00:10,000', endTime: '00:00:12,000', text: 'primary' }
+  ];
+  const trans = [
+    { id: '1', startTime: '00:00:06,000', endTime: '00:00:08,000', text: 'secondary' }
+  ];
+  const merged = mergeSubtitles(main, trans, {
+    mainLang: 'eng',
+    transLang: 'ara',
+    timingSource: 'independent',
+    matchThresholdMs: 5000
+  });
+  assert.strictEqual(merged.length, 2);
+  assert.strictEqual(merged[0].startTime, '00:00:06,000');
+  assert.ok(merged[0].text.includes('secondary'));
+  assert.strictEqual(merged[1].startTime, '00:00:10,000');
+  assert.ok(merged[1].text.includes('primary'));
+  assert.strictEqual(merged.alignment.timingSource, 'independent');
 });
 
 test('mergeSubtitles: never duplicates a trans cue across mains', () => {

@@ -113,7 +113,7 @@ const QUALITY_GATE_THRESHOLD = 0.85;
 // while keeping the serverless cold path bounded.
 const MAX_PAIR_ATTEMPTS = 3;
 const VIDEO_PARAM_KEYS = ['filename', 'videoSize', 'videoHash'];
-const TIMING_SOURCES = new Set(['primary', 'secondary']);
+const TIMING_SOURCES = new Set(['primary', 'secondary', 'independent']);
 
 // Configuration
 const ADDON_NAME = process.env.ADDON_NAME || 'Dual Subtitles';
@@ -533,8 +533,9 @@ const DUAL_SUB_TRANS_COLOR = '#94a3b8';
  *        primary cue (handles cue-boundary mismatches).
  * @param {boolean}     [options.enableOffset=true]
  * @param {boolean}     [options.enableDrift=true]
- * @param {'primary'|'secondary'} [options.timingSource='primary']
- *        Which track's original timestamps to use for the generated cue.
+ * @param {'primary'|'secondary'|'independent'} [options.timingSource='primary']
+ *        Which track's original timestamps to use. Independent emits separate
+ *        cues for each language so both can keep their own timings.
  */
 function mergeSubtitles(mainSubs, transSubs, options = {}) {
   const opts = typeof options === 'number'
@@ -588,8 +589,33 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
     const cleanMainText = cleanSubtitleText(mainSub.text, mainLang);
     if (!cleanMainText) continue;
 
-    let mergedText;
     const transIdxs = matches.get(mi);
+    if (renderTimingSource === 'independent') {
+      mergedSubs.push({
+        id: `${mainSub.id}-primary`,
+        startTime: mainSub.startTime,
+        endTime: mainSub.endTime,
+        text: `<b>${htmlEncodeSrt(cleanMainText)}</b>`
+      });
+
+      if (transIdxs && transIdxs.length > 0) {
+        for (const ti of transIdxs) {
+          const t = transTimed[ti];
+          if (!t) continue;
+          const cleanTransText = cleanSubtitleText(t.text, transLang);
+          if (!cleanTransText) continue;
+          mergedSubs.push({
+            id: `${mainSub.id}-secondary-${ti}`,
+            startTime: t.startTime,
+            endTime: t.endTime,
+            text: `<i><font color="${DUAL_SUB_TRANS_COLOR}">${htmlEncodeSrt(cleanTransText)}</font></i>`
+          });
+        }
+      }
+      continue;
+    }
+
+    let mergedText;
     if (transIdxs && transIdxs.length > 0) {
       const transParts = [];
       for (const ti of transIdxs) {
@@ -634,6 +660,14 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
       startTime: outputStartTime,
       endTime: outputEndTime,
       text: mergedText
+    });
+  }
+
+  if (renderTimingSource === 'independent') {
+    mergedSubs.sort((a, b) => {
+      const startDiff = parseTimeToMs(a.startTime) - parseTimeToMs(b.startTime);
+      if (startDiff !== 0) return startDiff;
+      return parseTimeToMs(a.endTime) - parseTimeToMs(b.endTime);
     });
   }
 
@@ -909,6 +943,22 @@ async function subtitlesHandler({ type, id, extra, config }) {
       ),
       lang: mainLang,
       SubtitlesName: `${subtitleTitle} (Secondary timing)`
+    }, {
+      id: `dual-${best.main.id}-${best.trans.id}-independent-time`,
+      url: buildDynamicSubtitleUrl(
+        type,
+        imdbId,
+        season,
+        episode,
+        mainLang,
+        transLang,
+        best.main.id,
+        best.trans.id,
+        videoParams,
+        { timingSource: 'independent' }
+      ),
+      lang: mainLang,
+      SubtitlesName: `${subtitleTitle} (Independent timing)`
     }];
 
     debugServer.log(
