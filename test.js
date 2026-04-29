@@ -554,6 +554,7 @@ test('parseExtra preserves dotted filenames and dotted key separators', () => {
 console.log('\n--- syncEngine ---');
 
 const {
+  estimateSequenceOffsetMs,
   estimateOffsetMs,
   applyOffset,
   estimateAffineMapping,
@@ -621,6 +622,21 @@ test('estimateOffsetMs: returns 0 when tracks already aligned', () => {
 test('estimateOffsetMs: returns 0 with empty inputs', () => {
   assert.strictEqual(estimateOffsetMs([], []), 0);
   assert.strictEqual(estimateOffsetMs(null, null), 0);
+});
+
+test('estimateSequenceOffsetMs: detects a uniform -4000ms secondary offset in dense dialogue', () => {
+  const main = makeTimedCues([
+    [1000, 2600, 'a'], [3100, 4700, 'b'], [5200, 6800, 'c'], [7300, 8900, 'd'],
+    [9400, 11000, 'e'], [11500, 13100, 'f'], [13600, 15200, 'g'], [15700, 17300, 'h'],
+    [17800, 19400, 'i'], [19900, 21500, 'j']
+  ]);
+  const trans = main.map((cue, i) => ({
+    ...cue,
+    id: `t${i + 1}`,
+    startMs: cue.startMs - 4000,
+    endMs: cue.endMs - 4000
+  }));
+  assert.strictEqual(estimateSequenceOffsetMs(main, trans), 4000);
 });
 
 test('applyOffset: shifts every cue by offset', () => {
@@ -732,6 +748,31 @@ test('mergeSubtitles: fixes Sopranos-style off-by-one shift', () => {
     const occurrences = merged.filter(m => m.text.includes(t)).length;
     assert.strictEqual(occurrences, 1, `"${t}" should appear in exactly one merged cue, got ${occurrences}`);
   }
+});
+
+test('mergeSubtitles: sequence offset keeps dense shifted tracks on the same cue', () => {
+  const main = [];
+  const trans = [];
+  for (let i = 0; i < 12; i++) {
+    const start = 10000 + i * 2500;
+    const end = start + 1600;
+    main.push({
+      id: String(i + 1),
+      startTime: msToSrtTime(start),
+      endTime: msToSrtTime(end),
+      text: `primary-${i + 1}`
+    });
+    trans.push({
+      id: String(i + 1),
+      startTime: msToSrtTime(start - 4000),
+      endTime: msToSrtTime(end - 4000),
+      text: `secondary-${i + 1}`
+    });
+  }
+
+  const merged = mergeSubtitles(main, trans, { mainLang: 'eng', transLang: 'ara' });
+  assert.ok(merged[5].text.includes('primary-6'));
+  assert.ok(merged[5].text.includes('secondary-6'), 'translation should stay on the same cue after sequence offset');
 });
 
 test('mergeSubtitles: never duplicates a trans cue across mains', () => {
