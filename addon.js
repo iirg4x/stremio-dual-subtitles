@@ -113,6 +113,7 @@ const QUALITY_GATE_THRESHOLD = 0.85;
 // while keeping the serverless cold path bounded.
 const MAX_PAIR_ATTEMPTS = 3;
 const VIDEO_PARAM_KEYS = ['filename', 'videoSize', 'videoHash'];
+const TIMING_SOURCES = new Set(['primary', 'secondary']);
 
 // Configuration
 const ADDON_NAME = process.env.ADDON_NAME || 'Dual Subtitles';
@@ -313,12 +314,16 @@ function serializeVideoParams(params = {}) {
   return search.toString();
 }
 
+function normalizeTimingSource(timingSource) {
+  return TIMING_SOURCES.has(timingSource) ? timingSource : 'primary';
+}
+
 function videoParamsCacheFragment(params = {}) {
   const serialized = serializeVideoParams(params);
   return serialized ? `_${serialized}` : '';
 }
 
-function buildDynamicSubtitleUrl(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams = {}) {
+function buildDynamicSubtitleUrl(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams = {}, options = {}) {
   const dynamicParams = [
     type,
     imdbId,
@@ -330,7 +335,10 @@ function buildDynamicSubtitleUrl(type, imdbId, season, episode, mainLang, transL
     transSubId
   ].join('/');
 
-  const query = serializeVideoParams(videoParams);
+  const search = new URLSearchParams(serializeVideoParams(videoParams));
+  const timingSource = normalizeTimingSource(options.timingSource);
+  if (timingSource !== 'primary') search.set('timingSource', timingSource);
+  const query = search.toString();
   return `{{ADDON_URL}}/subs/${dynamicParams}.srt${query ? `?${query}` : ''}`;
 }
 
@@ -525,6 +533,8 @@ const DUAL_SUB_TRANS_COLOR = '#94a3b8';
  *        primary cue (handles cue-boundary mismatches).
  * @param {boolean}     [options.enableOffset=true]
  * @param {boolean}     [options.enableDrift=true]
+ * @param {'primary'|'secondary'} [options.timingSource='primary']
+ *        Which track's original timestamps to use for the generated cue.
  */
 function mergeSubtitles(mainSubs, transSubs, options = {}) {
   const opts = typeof options === 'number'
@@ -537,8 +547,10 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
     matchThresholdMs = 1500,
     allowMultiTrans = true,
     enableOffset = true,
-    enableDrift = true
+    enableDrift = true,
+    timingSource = 'primary'
   } = opts;
+  const renderTimingSource = normalizeTimingSource(timingSource);
 
   const mainTimed = [];
   for (const s of mainSubs || []) {
@@ -601,10 +613,26 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
 
     if (!mergedText) continue;
 
+    let outputStartTime = mainSub.startTime;
+    let outputEndTime = mainSub.endTime;
+    if (renderTimingSource === 'secondary' && transIdxs && transIdxs.length > 0) {
+      const timingSubs = transIdxs
+        .map(ti => transTimed[ti])
+        .filter(Boolean);
+      if (timingSubs.length > 0) {
+        const startMs = Math.min(...timingSubs.map(t => t.startMs));
+        const endMs = Math.max(...timingSubs.map(t => t.endMs));
+        if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs) {
+          outputStartTime = msToSrtTime(startMs);
+          outputEndTime = msToSrtTime(endMs);
+        }
+      }
+    }
+
     mergedSubs.push({
       id: mainSub.id,
-      startTime: mainSub.startTime,
-      endTime: mainSub.endTime,
+      startTime: outputStartTime,
+      endTime: outputEndTime,
       text: mergedText
     });
   }
@@ -622,7 +650,8 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
       drift: alignment.drift,
       localAnchors: alignment.localAnchors,
       matchedCount: matches.size,
-      mainCount: mainTimed.length
+      mainCount: mainTimed.length,
+      timingSource: renderTimingSource
     },
     enumerable: false
   });
@@ -700,8 +729,9 @@ function getSubtitle(key) {
  *   passedGate: boolean
  * } | null>}
  */
-async function selectAndMergeBestPair(candidatePairs, mainLang, transLang) {
+async function selectAndMergeBestPair(candidatePairs, mainLang, transLang, options = {}) {
   if (!Array.isArray(candidatePairs) || candidatePairs.length === 0) return null;
+  const timingSource = normalizeTimingSource(options.timingSource);
 
   const parsedCache = new Map();
   async function getParsed(sub, lang) {
@@ -735,7 +765,7 @@ async function selectAndMergeBestPair(candidatePairs, mainLang, transLang) {
       continue;
     }
 
-    const merged = mergeSubtitles(mainParsed, transParsed, { mainLang, transLang });
+    const merged = mergeSubtitles(mainParsed, transParsed, { mainLang, transLang, timingSource });
     const matchRate = merged && merged.matchRate != null ? merged.matchRate : 0;
     debugServer.log(`  match rate: ${(matchRate * 100).toFixed(1)}%`);
 
@@ -843,8 +873,12 @@ async function subtitlesHandler({ type, id, extra, config }) {
     // code ran the entire pipeline twice (once here for nothing).
     const best = candidatePairs[0];
 
+    const subtitleTitle =
+      `Dual (${mainLang.toUpperCase()}+${transLang.toUpperCase()}) - ` +
+      `${getLanguageName(mainLang)} + ${getLanguageName(transLang)}`;
+
     const finalSubtitles = [{
-      id: `dual-${best.main.id}-${best.trans.id}`,
+      id: `dual-${best.main.id}-${best.trans.id}-primary-time`,
       url: buildDynamicSubtitleUrl(
         type,
         imdbId,
@@ -854,12 +888,27 @@ async function subtitlesHandler({ type, id, extra, config }) {
         transLang,
         best.main.id,
         best.trans.id,
-        videoParams
+        videoParams,
+        { timingSource: 'primary' }
       ),
       lang: mainLang,
-      SubtitlesName:
-        `Dual (${mainLang.toUpperCase()}+${transLang.toUpperCase()}) - ` +
-        `${getLanguageName(mainLang)} + ${getLanguageName(transLang)}`
+      SubtitlesName: `${subtitleTitle} (Primary timing)`
+    }, {
+      id: `dual-${best.main.id}-${best.trans.id}-secondary-time`,
+      url: buildDynamicSubtitleUrl(
+        type,
+        imdbId,
+        season,
+        episode,
+        mainLang,
+        transLang,
+        best.main.id,
+        best.trans.id,
+        videoParams,
+        { timingSource: 'secondary' }
+      ),
+      lang: mainLang,
+      SubtitlesName: `${subtitleTitle} (Secondary timing)`
     }];
 
     debugServer.log(
@@ -888,13 +937,15 @@ builder.defineSubtitlesHandler(subtitlesHandler);
  * entirely — even ahead of Vercel's edge cache (which ALSO caches via
  * Cache-Control headers in server.js routes).
  */
-async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams = {}) {
+async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, transLang, mainSubId, transSubId, videoParams = {}, options = {}) {
   debugServer.log('Dynamic subtitle generation:', { type, imdbId, mainLang, transLang });
 
   const normalizedVideoParams = normalizeVideoParams(videoParams);
+  const timingSource = normalizeTimingSource(options.timingSource);
   const cacheKey =
     `${imdbId}_${season || ''}_${episode || ''}_${mainLang}_${transLang}_${mainSubId}_${transSubId}` +
-    videoParamsCacheFragment(normalizedVideoParams);
+    videoParamsCacheFragment(normalizedVideoParams) +
+    `_timing_${timingSource}`;
   const cached = getSubtitle(cacheKey);
   if (cached) {
     debugServer.log(`Cache hit (in-instance): ${cacheKey}`);
@@ -953,7 +1004,7 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
 
     if (orderedPairs.length === 0) return null;
 
-    const best = await selectAndMergeBestPair(orderedPairs, mainLang, transLang);
+    const best = await selectAndMergeBestPair(orderedPairs, mainLang, transLang, { timingSource });
     if (!best || !best.merged || best.merged.length === 0) {
       debugServer.warn('No usable merged subtitle from any pair');
       return null;
@@ -995,6 +1046,7 @@ module.exports = {
     normalizeVideoParams,
     serializeVideoParams,
     buildDynamicSubtitleUrl,
+    normalizeTimingSource,
     decodeSubtitleEntities,
     cleanSubtitleText
   }

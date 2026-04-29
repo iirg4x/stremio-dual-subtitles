@@ -22,6 +22,7 @@ const {
     normalizeVideoParams,
     serializeVideoParams,
     buildDynamicSubtitleUrl,
+    normalizeTimingSource,
     decodeSubtitleEntities
   },
   manifest
@@ -524,6 +525,29 @@ test('buildDynamicSubtitleUrl preserves video matching params as query string', 
   assert.ok(url.includes('videoHash=abc123'));
 });
 
+test('buildDynamicSubtitleUrl can request secondary subtitle timing', () => {
+  const url = buildDynamicSubtitleUrl(
+    'movie',
+    '0111161',
+    '0',
+    '0',
+    'eng',
+    'ara',
+    'main-id',
+    'trans-id',
+    { filename: 'Movie.2020.mkv' },
+    { timingSource: 'secondary' }
+  );
+  assert.ok(url.includes('filename=Movie.2020.mkv'));
+  assert.ok(url.includes('timingSource=secondary'));
+});
+
+test('normalizeTimingSource rejects unknown values', () => {
+  assert.strictEqual(normalizeTimingSource('secondary'), 'secondary');
+  assert.strictEqual(normalizeTimingSource('embedded'), 'primary');
+  assert.strictEqual(normalizeTimingSource(null), 'primary');
+});
+
 test('serializeVideoParams URL-encodes unsafe filename characters', () => {
   assert.strictEqual(
     serializeVideoParams({ filename: 'Movie Name #1.mkv' }),
@@ -773,6 +797,38 @@ test('mergeSubtitles: sequence offset keeps dense shifted tracks on the same cue
   const merged = mergeSubtitles(main, trans, { mainLang: 'eng', transLang: 'ara' });
   assert.ok(merged[5].text.includes('primary-6'));
   assert.ok(merged[5].text.includes('secondary-6'), 'translation should stay on the same cue after sequence offset');
+});
+
+test('mergeSubtitles: secondary timing source uses matched secondary cue times', () => {
+  const main = [
+    { id: '1', startTime: '00:00:10,000', endTime: '00:00:12,000', text: 'primary' }
+  ];
+  const trans = [
+    { id: '1', startTime: '00:00:06,000', endTime: '00:00:08,000', text: 'secondary' }
+  ];
+  const merged = mergeSubtitles(main, trans, {
+    mainLang: 'eng',
+    transLang: 'ara',
+    timingSource: 'secondary',
+    matchThresholdMs: 5000
+  });
+  assert.strictEqual(merged.length, 1);
+  assert.strictEqual(merged[0].startTime, '00:00:06,000');
+  assert.strictEqual(merged[0].endTime, '00:00:08,000');
+  assert.ok(merged[0].text.includes('primary'));
+  assert.ok(merged[0].text.includes('secondary'));
+});
+
+test('mergeSubtitles: primary timing remains the default timing source', () => {
+  const main = [
+    { id: '1', startTime: '00:00:10,000', endTime: '00:00:12,000', text: 'primary' }
+  ];
+  const trans = [
+    { id: '1', startTime: '00:00:10,000', endTime: '00:00:12,000', text: 'secondary' }
+  ];
+  const merged = mergeSubtitles(main, trans, { mainLang: 'eng', transLang: 'ara' });
+  assert.strictEqual(merged[0].startTime, '00:00:10,000');
+  assert.strictEqual(merged.alignment.timingSource, 'primary');
 });
 
 test('mergeSubtitles: never duplicates a trans cue across mains', () => {
