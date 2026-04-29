@@ -467,14 +467,38 @@ function joinSubtitleLines(text, langCode) {
   return text.replace(/\r?\n|\r/g, cjk ? '' : ' ').trim();
 }
 
+function decodeSubtitleEntities(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/&quot;/gi, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#x22;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&#60;/g, '<')
+    .replace(/&#x3c;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#62;/g, '>')
+    .replace(/&#x3e;/gi, '>')
+    .replace(/&amp;/gi, '&');
+}
+
+function cleanSubtitleText(text, langCode) {
+  return joinSubtitleLines(
+    decodeSubtitleEntities(sanitize(text || '', { allowedTags: [], allowedAttributes: {} })),
+    langCode
+  );
+}
+
 /** Escape text embedded in SRT HTML tags (avoid breaking markup / injection). */
 function htmlEncodeSrt(text) {
   if (!text) return '';
   return String(text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/>/g, '&gt;');
 }
 
 /** Muted color for secondary line; players that ignore <font> still have <b> + › marker. */
@@ -549,10 +573,7 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
   for (let mi = 0; mi < mainTimed.length; mi++) {
     const mainSub = mainTimed[mi];
 
-    const cleanMainText = joinSubtitleLines(
-      sanitize(mainSub.text, { allowedTags: [], allowedAttributes: {} }),
-      mainLang
-    );
+    const cleanMainText = cleanSubtitleText(mainSub.text, mainLang);
     if (!cleanMainText) continue;
 
     let mergedText;
@@ -562,10 +583,7 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
       for (const ti of transIdxs) {
         const t = transTimed[ti];
         if (!t) continue;
-        const piece = joinSubtitleLines(
-          sanitize(t.text, { allowedTags: [], allowedAttributes: {} }),
-          transLang
-        );
+        const piece = cleanSubtitleText(t.text, transLang);
         if (piece) transParts.push(piece);
       }
       if (transParts.length > 0) {
@@ -573,7 +591,7 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
         const encMain = htmlEncodeSrt(cleanMainText);
         const encTrans = htmlEncodeSrt(cleanTransText);
         mergedText =
-          `<b>${encMain}</b>\n\u203a <i><font color="${DUAL_SUB_TRANS_COLOR}">${encTrans}</font></i>`;
+          `<b>${encMain}</b>\n<i><font color="${DUAL_SUB_TRANS_COLOR}">${encTrans}</font></i>`;
       }
     }
 
@@ -976,6 +994,8 @@ module.exports = {
     parseTimestampLine,
     normalizeVideoParams,
     serializeVideoParams,
-    buildDynamicSubtitleUrl
+    buildDynamicSubtitleUrl,
+    decodeSubtitleEntities,
+    cleanSubtitleText
   }
 };

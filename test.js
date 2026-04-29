@@ -21,7 +21,8 @@ const {
     parseTimestampLine,
     normalizeVideoParams,
     serializeVideoParams,
-    buildDynamicSubtitleUrl
+    buildDynamicSubtitleUrl,
+    decodeSubtitleEntities
   },
   manifest
 } = require('./addon');
@@ -342,7 +343,7 @@ test('Backward compat: numeric threshold still works', () => {
   assert.ok(result[0].text.includes('Hola'));
 });
 
-test('Dual merge distinguishes lines: bold primary, marker, colored secondary [Issue #9]', () => {
+test('Dual merge distinguishes lines: bold primary and colored secondary [Issue #9]', () => {
   const main = [
     { id: '1', startTime: '00:00:01,000', endTime: '00:00:04,000', text: 'Hello' }
   ];
@@ -352,10 +353,30 @@ test('Dual merge distinguishes lines: bold primary, marker, colored secondary [I
   const result = mergeSubtitles(main, trans, { mainLang: 'eng', transLang: 'spa' });
   assert.strictEqual(result.length, 1);
   assert.ok(result[0].text.includes('<b>Hello</b>'), 'primary line should be bold');
-  assert.ok(result[0].text.includes('\u203a '), 'secondary line should include a visible marker');
+  assert.ok(!result[0].text.includes('\u203a '), 'secondary line should not include a visible marker');
   assert.ok(
     result[0].text.includes(`<font color="#94a3b8">`),
     'secondary should use a muted color where the player supports it'
+  );
+});
+
+test('Dual merge decodes subtitle entities before rendering', () => {
+  const main = [
+    { id: '1', startTime: '00:00:01,000', endTime: '00:00:04,000', text: 'You can do this.' }
+  ];
+  const trans = [
+    { id: '1', startTime: '00:00:01,000', endTime: '00:00:04,000', text: '&quot;يمكنك فعل هذا&quot;' }
+  ];
+  const result = mergeSubtitles(main, trans, { mainLang: 'eng', transLang: 'ara' });
+  assert.strictEqual(result.length, 1);
+  assert.ok(result[0].text.includes('"يمكنك فعل هذا"'), 'HTML entities should render as normal quotes');
+  assert.ok(!result[0].text.includes('&quot;'), 'quote entities should not leak into rendered subtitle text');
+});
+
+test('decodeSubtitleEntities handles common named and numeric entities', () => {
+  assert.strictEqual(
+    decodeSubtitleEntities('&quot;A&amp;B&#x22; &lt;tag&gt;'),
+    '"A&B" <tag>'
   );
 });
 
