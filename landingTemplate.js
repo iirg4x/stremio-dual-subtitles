@@ -344,11 +344,73 @@ function generateLandingHTML(manifest, baseUrl) {
       background: rgba(34, 211, 238, 0.1);
       color: var(--accent);
     }
-    
+
     .tag-native {
       background: rgba(139, 92, 246, 0.1);
       color: var(--secondary);
     }
+
+    /* Advanced section */
+    .advanced-toggle {
+      width: 100%;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 10px 16px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: inherit;
+      margin-bottom: 0;
+      transition: all 0.2s;
+    }
+    .advanced-toggle:hover { color: var(--text); border-color: rgba(255,255,255,0.15); }
+    .advanced-toggle svg { width: 15px; height: 15px; transition: transform 0.2s; }
+    .advanced-toggle.open svg { transform: rotate(180deg); }
+
+    .advanced-body {
+      display: none;
+      padding: 16px 0 0;
+    }
+    .advanced-body.open { display: block; }
+
+    .advanced-note {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+      line-height: 1.5;
+    }
+    .advanced-note a { color: var(--primary-light); text-decoration: none; }
+
+    .form-group input[type="text"],
+    .form-group input[type="password"] {
+      width: 100%;
+      padding: 11px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 13px;
+      font-family: 'Inter', monospace, sans-serif;
+      transition: all 0.2s;
+    }
+    .form-group input[type="text"]:focus,
+    .form-group input[type="password"]:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+    }
+    .form-group input::placeholder { color: var(--text-muted); opacity: 0.6; }
+    .form-group .input-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 5px;
+    }
+    .form-group .input-hint a { color: var(--primary-light); text-decoration: none; }
     
     select {
       width: 100%;
@@ -822,12 +884,55 @@ function generateLandingHTML(manifest, baseUrl) {
           </select>
         </div>
         
+        <!-- Advanced options -->
+        <div style="margin-bottom:20px">
+          <button type="button" class="advanced-toggle" id="advancedToggle" onclick="toggleAdvanced()">
+            Advanced Options (API Keys)
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
+          <div class="advanced-body" id="advancedBody">
+            <p class="advanced-note">
+              Optional API keys unlock extra subtitle sources. Keys are stored in your addon URL only — never on our servers.
+              <a href="${baseUrl}/privacy" target="_blank">Privacy policy →</a>
+            </p>
+
+            <div class="form-group">
+              <label>Wyzie Subs Key <span style="font-weight:400;color:var(--text-muted)">(Podnapisi + YIFY)</span></label>
+              <input type="password" id="wyzieKey" placeholder="wyzie-your-key" autocomplete="off">
+              <div class="input-hint"><a href="https://sub.wyzie.io/redeem" target="_blank">Get a free key →</a></div>
+            </div>
+
+            <div class="form-group">
+              <label>SubDL Key</label>
+              <input type="password" id="subdlKey" placeholder="your-subdl-key" autocomplete="off">
+              <div class="input-hint"><a href="https://subdl.com/app/key" target="_blank">Get a free key →</a></div>
+            </div>
+
+            <div class="form-group">
+              <label>Jimaku Key <span style="font-weight:400;color:var(--text-muted)">(anime, optional)</span></label>
+              <input type="password" id="jimakuKey" placeholder="your-jimaku-key" autocomplete="off">
+              <div class="input-hint"><a href="https://jimaku.cc/" target="_blank">jimaku.cc →</a></div>
+            </div>
+
+            <div class="form-group">
+              <label>LibreTranslate URL <span style="font-weight:400;color:var(--text-muted)">(auto-translate fallback)</span></label>
+              <input type="text" id="ltUrl" placeholder="http://localhost:5000" autocomplete="off">
+              <div class="input-hint">Translates when no subtitle is available. <a href="https://libretranslate.com/" target="_blank">Self-host →</a></div>
+            </div>
+
+            <div class="form-group">
+              <label>LibreTranslate API Key <span style="font-weight:400;color:var(--text-muted)">(if required)</span></label>
+              <input type="password" id="ltKey" placeholder="optional" autocomplete="off">
+            </div>
+          </div>
+        </div>
+
         <div class="preview-box">
           <div class="preview-label">Live Preview</div>
           <div class="preview-primary" id="previewPrimary">Hello, how are you today?</div>
           <div class="preview-secondary" id="previewSecondary">Merhaba, bugün nasılsın?</div>
         </div>
-        
+
         <button type="button" class="btn btn-primary" onclick="installAddon()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -1092,10 +1197,34 @@ function generateLandingHTML(manifest, baseUrl) {
     document.getElementById('transLang').addEventListener('change', updatePreview);
     updatePreview();
     
+    function toggleAdvanced() {
+      const btn = document.getElementById('advancedToggle');
+      const body = document.getElementById('advancedBody');
+      btn.classList.toggle('open');
+      body.classList.toggle('open');
+    }
+
     function getConfigUrl() {
-      const main = encodeURIComponent(document.getElementById('mainLang').value);
-      const trans = encodeURIComponent(document.getElementById('transLang').value);
-      return BASE_URL + '/' + main + '|' + trans + '/manifest.json';
+      const main = document.getElementById('mainLang').value;
+      const trans = document.getElementById('transLang').value;
+
+      // Build optional key=value pairs for any provided API keys
+      const extras = [];
+      const wyzie  = document.getElementById('wyzieKey').value.trim();
+      const subdl  = document.getElementById('subdlKey').value.trim();
+      const jimaku = document.getElementById('jimakuKey').value.trim();
+      const ltUrl  = document.getElementById('ltUrl').value.trim();
+      const ltKey  = document.getElementById('ltKey').value.trim();
+      if (wyzie)  extras.push('wyzie='  + wyzie);
+      if (subdl)  extras.push('subdl='  + subdl);
+      if (jimaku) extras.push('jimaku=' + jimaku);
+      if (ltUrl)  extras.push('lt='     + ltUrl);
+      if (ltKey)  extras.push('ltkey='  + ltKey);
+
+      // Pipe-separate all parts, then URL-encode the whole config segment
+      const configParts = [main, trans, ...extras];
+      const configSegment = encodeURIComponent(configParts.join('|'));
+      return BASE_URL + '/' + configSegment + '/manifest.json';
     }
     
     function showToast(msg) {

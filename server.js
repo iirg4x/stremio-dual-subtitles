@@ -89,19 +89,34 @@ app.use(express.static(path.join(__dirname, 'public'), {
   etag: true
 }));
 
-// Basic rate limiter (per IP)
+// Basic rate limiter (per IP). On serverless this is per-instance; that's
+// documented behavior. The sweep below keeps the Map from leaking memory on
+// long-running self-hosts where unique IPs accumulate forever otherwise.
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
+const RATE_LIMIT_SWEEP_INTERVAL_MS = 60_000;
 const rateLimitStore = new Map();
+let lastRateLimitSweep = 0;
+
+function sweepRateLimit(now) {
+  for (const [ip, entry] of rateLimitStore) {
+    if (now > entry.resetAt) rateLimitStore.delete(ip);
+  }
+}
 
 app.use((req, res, next) => {
   // Skip rate limiting for static files and health check
   if (req.path.startsWith('/logo') || req.path === '/health') {
     return next();
   }
-  
+
   const ip = getClientIP(req);
   const now = Date.now();
+
+  if (now - lastRateLimitSweep > RATE_LIMIT_SWEEP_INTERVAL_MS) {
+    sweepRateLimit(now);
+    lastRateLimitSweep = now;
+  }
 
   if (!rateLimitStore.has(ip)) {
     rateLimitStore.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
@@ -130,13 +145,34 @@ app.use((req, res, next) => {
 // API ENDPOINTS
 // ============================================================================
 
+// Validate untrusted /api/track input before it enters analytics state.
+// The dashboard renders these values as HTML; the cap protects against both
+// XSS sneaking past escaping and memory growth from spammed unique strings.
+const TRACK_EVENTS = new Set(['pageView', 'install', 'subtitleRequest']);
+const TRACK_CONTENT_TYPES = new Set(['movie', 'series']);
+const TRACK_MAX_STRING_LEN = 64;
+
+function clampString(value, max = TRACK_MAX_STRING_LEN) {
+  if (value == null) return undefined;
+  const str = String(value);
+  return str.length > max ? str.slice(0, max) : str;
+}
+
 // Analytics tracking endpoint
 app.post('/api/track', (req, res) => {
   try {
-    const { event, page, mainLang, transLang, contentType } = req.body;
+    const body = req.body || {};
+    if (!TRACK_EVENTS.has(body.event)) {
+      return res.json({ success: false });
+    }
+
     const ip = getClientIP(req);
-    
-    switch (event) {
+    const page = clampString(body.page);
+    const mainLang = clampString(body.mainLang);
+    const transLang = clampString(body.transLang);
+    const contentType = TRACK_CONTENT_TYPES.has(body.contentType) ? body.contentType : undefined;
+
+    switch (body.event) {
       case 'pageView':
         trackPageView(ip, page);
         break;
@@ -147,7 +183,7 @@ app.post('/api/track', (req, res) => {
         trackSubtitleRequest(mainLang, transLang, contentType);
         break;
     }
-    
+
     res.json({ success: true });
   } catch (error) {
     res.json({ success: false });
@@ -183,16 +219,14 @@ app.get('/configure', (req, res) => {
 // Analytics dashboard (protected with secret key)
 app.get('/stats', (req, res) => {
   const analyticsSecret = process.env.ANALYTICS_SECRET;
-  
-  // If secret is set, require it in query parameter
-  if (analyticsSecret && req.query.key !== analyticsSecret) {
-    const baseUrl = getExternalUrl(req);
-    const manifestWithLogo = getManifestWithLogo(req);
-    return res.status(401).send(generateErrorHTML(401, 'Unauthorized', baseUrl, manifestWithLogo));
-  }
-  
   const baseUrl = getExternalUrl(req);
   const manifestWithLogo = getManifestWithLogo(req);
+
+  // If secret is set, require it in query parameter
+  if (analyticsSecret && req.query.key !== analyticsSecret) {
+    return res.status(401).send(generateErrorHTML(401, 'Unauthorized', baseUrl, manifestWithLogo));
+  }
+
   const stats = getAnalyticsSummary();
   const html = generateStatsHTML(stats, baseUrl, manifestWithLogo);
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -332,21 +366,72 @@ app.get('/:config/configure', (req, res) => {
   res.redirect('/configure');
 });
 
+// ============================================================================
+// Config parameter parsing
+// ============================================================================
+
+/**
+ * Parse the URL config segment.
+ *
+ * Format (pipe-separated, URL-decoded):
+ *   {mainLang}|{transLang}[|key=value ...]
+ *
+ * Optional key=value pairs (any order after the first two fields):
+ *   wyzie=KEY         WYZIE_API_KEY
+ *   subdl=KEY         SUBDL_API_KEY
+ *   jimaku=KEY        JIMAKU_API_KEY
+ *   lt=URL            LIBRETRANSLATE_URL
+ *   ltkey=KEY         LIBRETRANSLATE_API_KEY
+ *
+ * Old format (two fields only) is fully backward-compatible.
+ *
+ * @returns {{ mainLang, transLang, envOverrides: object } | null}
+ */
+function parseConfigParam(raw) {
+  if (!raw) return null;
+  const decoded = decodeURIComponent(raw);
+  const parts = decoded.split('|');
+  const mainLang = parts[0] || '';
+  const transLang = parts[1] || '';
+  if (!mainLang || !transLang) return null;
+
+  const envOverrides = {};
+  for (let i = 2; i < parts.length; i++) {
+    const eq = parts[i].indexOf('=');
+    if (eq < 1) continue;
+    const k = parts[i].slice(0, eq).trim();
+    const v = parts[i].slice(eq + 1).trim();
+    if (!v) continue;
+    switch (k) {
+      case 'wyzie':   envOverrides.WYZIE_API_KEY           = v; break;
+      case 'subdl':   envOverrides.SUBDL_API_KEY            = v; break;
+      case 'jimaku':  envOverrides.JIMAKU_API_KEY           = v; break;
+      case 'lt':      envOverrides.LIBRETRANSLATE_URL       = v; break;
+      case 'ltkey':   envOverrides.LIBRETRANSLATE_API_KEY   = v; break;
+    }
+  }
+
+  return { mainLang, transLang, envOverrides };
+}
+
+// Merge user-supplied per-request API keys with server env vars.
+// Per-request keys take precedence so users can supply their own without
+// needing server-side env changes.
+function mergeEnv(envOverrides) {
+  return { ...process.env, ...envOverrides };
+}
+
 // Configuration-specific manifest
 app.get('/:config/manifest.json', (req, res) => {
   try {
-    const configParam = decodeURIComponent(req.params.config);
-    const [mainLang, transLang] = configParam.split('|');
-    
-    if (!mainLang || !transLang) {
-      return res.status(400).json({ error: 'Invalid configuration' });
-    }
+    const parsed = parseConfigParam(req.params.config);
+    if (!parsed) return res.status(400).json({ error: 'Invalid configuration' });
 
+    const { mainLang, transLang } = parsed;
     const mainCode = parseLangCode(mainLang);
     const transCode = parseLangCode(transLang);
     const baseUrl = getExternalUrl(req);
 
-    // Create configured manifest
     const configuredManifest = {
       ...manifest,
       id: `${manifest.id}.${mainCode}.${transCode}`,
@@ -368,27 +453,20 @@ app.get('/:config/manifest.json', (req, res) => {
 // Configuration-specific subtitles handler
 app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
   try {
-    const configParam = decodeURIComponent(req.params.config);
-    const [mainLang, transLang] = configParam.split('|');
-    
-    if (!mainLang || !transLang) {
-      return res.status(400).json({ subtitles: [] });
-    }
+    const parsed = parseConfigParam(req.params.config);
+    if (!parsed) return res.status(400).json({ subtitles: [] });
 
+    const { mainLang, transLang, envOverrides } = parsed;
     const { type, id } = req.params;
     const extra = req.params.extra ? parseExtra(req.params.extra) : {};
 
-    const config = {
-      mainLang,
-      transLang
-    };
+    const config = { mainLang, transLang, envOverrides };
 
     trackSubtitleRequest(parseLangCode(mainLang), parseLangCode(transLang), type, id);
     debugServer.log(`Subtitle request: ${type}/${id}, langs: ${parseLangCode(mainLang)}+${parseLangCode(transLang)}`);
 
     const result = await subtitlesHandler({ type, id, extra, config });
-    
-    // Replace placeholder URL with actual server URL
+
     const baseUrl = getExternalUrl(req);
     if (result.subtitles) {
       result.subtitles = result.subtitles.map(sub => ({
@@ -397,8 +475,6 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
       }));
     }
 
-    // Keep subtitle-list responses fresh while timing variants are changing;
-    // stale lists can leave removed options visible in Stremio.
     res.setHeader('Cache-Control', 'no-store, max-age=0');
     res.json(result);
   } catch (error) {
@@ -411,20 +487,18 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
 function parseExtra(extraStr) {
   const extra = {};
   if (!extraStr) return extra;
-  
+
   // Stremio addon extras are query-string shaped, but they arrive as a path
-  // segment. Preserve dots inside filenames while still tolerating older
-  // dotted key=value separators.
-  const normalized = extraStr.replace(
-    /\.(?=(?:videoHash|videoSize|filename|imdbId|season|episode)=)/g,
-    '&'
-  );
+  // segment. Older clients separated key=value pairs with dots, which collides
+  // with dots inside filenames. Treat a dot as a separator only when followed
+  // by a well-formed JS-identifier key + `=`, so `Movie.2020.mkv` survives.
+  const normalized = extraStr.replace(/\.(?=[A-Za-z_][A-Za-z0-9_-]*=)/g, '&');
 
   const params = new URLSearchParams(normalized);
   for (const [key, value] of params) {
     if (key) extra[key] = value;
   }
-  
+
   return extra;
 }
 
@@ -474,4 +548,4 @@ if (!process.env.VERCEL) {
 
 // Export for Vercel
 module.exports = app;
-module.exports._test = { parseExtra };
+module.exports._test = { parseExtra, parseConfigParam };

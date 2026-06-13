@@ -10,6 +10,7 @@ const axios = require('axios');
 const pako = require('pako');
 const sanitize = require('sanitize-html');
 const { debugServer, sanitizeForLogging } = require('./lib/debug');
+const pkg = require('./package.json');
 /**
  * Simple SRT parser (more reliable than external libraries)
  */
@@ -91,11 +92,11 @@ function formatSrtSimple(subtitles) {
   return lines.join('\n');
 }
 
-const { decodeSubtitleBuffer, getLanguageAliases, isCjkLanguage } = require('./encoding');
+const { decodeSubtitleBuffer, isCjkLanguage } = require('./encoding');
+const { parseKitsuId } = require('./lib/animeSource');
+const { translateSubtitles, isAvailable: isTranslatorAvailable } = require('./lib/localTranslator');
 const {
-  languageMap,
   getLanguageOptions,
-  extractBrowserLanguage,
   parseLangCode,
   getLanguageName
 } = require('./languages');
@@ -106,10 +107,6 @@ const {
   getEnabledSubtitleSources,
   getSubtitleSourceSummary
 } = require('./lib/subtitleSources');
-const {
-  isTranslationConfigured,
-  translateTexts
-} = require('./lib/translation');
 
 // Match rate at or above this is considered "good enough" — we stop
 // trying further candidate pairs. Empirically high-quality matches land
@@ -123,11 +120,11 @@ const QUALITY_GATE_THRESHOLD = 0.85;
 const MAX_PAIR_ATTEMPTS = 3;
 const VIDEO_PARAM_KEYS = ['filename', 'videoSize', 'videoHash'];
 const TIMING_SOURCES = new Set(['primary', 'secondary']);
-const SUBTITLE_MODES = new Set(['dual', 'translate-primary']);
+const SUBTITLE_MODES = new Set(['dual']);
 
 // Configuration
 const ADDON_NAME = process.env.ADDON_NAME || 'Dual Subtitles';
-const ADDON_VERSION = '1.0.0';
+const ADDON_VERSION = pkg.version;
 
 
 
@@ -139,7 +136,7 @@ const manifest = {
   description: 'Watch movies and series with dual subtitles - see two languages simultaneously for better language learning!',
   resources: ['subtitles'],
   types: ['movie', 'series'],
-  idPrefixes: ['tt'],
+  idPrefixes: ['tt', 'kitsu'],
   catalogs: [],
   logo: '/logo.png',
   behaviorHints: {
@@ -200,6 +197,7 @@ async function fetchAllSubtitles(imdbId, type, season = null, episode = null, vi
       episode,
       videoParams: normalizedVideoParams,
       languages: options.languages || [],
+      kitsuId: options.kitsuId || null,
       env: options.env || process.env
     });
 
@@ -229,32 +227,33 @@ async function fetchAllSubtitles(imdbId, type, season = null, episode = null, vi
 }
 
 /**
- * Filter subtitles by language code.
- */
-function filterSubtitlesByLanguage(allSubtitles, languageId) {
-  if (!allSubtitles) return null;
-
-  const codesToMatch = getLanguageAliases(languageId);
-  const langSubs = allSubtitles.filter(sub => codesToMatch.includes(sub.lang));
-
-  if (langSubs.length === 0) return null;
-
-  // Sort by downloads (higher = better quality typically)
-  langSubs.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
-
-  return langSubs.map((sub, idx) => ({
-    id: sub.id,
-    url: sub.url,
-    lang: sub.lang,
-    langName: languageMap[sub.lang] || sub.lang,
-    downloads: sub.downloads || (langSubs.length - idx)
-  }));
-}
-
-/**
  * Fetch and decode subtitle content from URL.
  */
+// Post-decompress size cap. The 5MB axios cap only bounds the wire payload;
+// a small .gz can balloon to hundreds of MB and OOM the function.
+const MAX_DECOMPRESSED_BYTES = 20 * 1024 * 1024;
+
+// Minimum usable cue count for a parsed subtitle. Movies and TV episodes
+// always have dozens of cues; below this it's almost certainly a "forced"
+// track (signs/songs only) or a broken/partial file. Setting it low keeps
+// niche short-form content working.
+const MIN_USABLE_CUES = 10;
+
+// Matches subtitles flagged as forced via path/filename. Most providers don't
+// set Content-Disposition with this hint, but the URL almost always carries
+// it (e.g. ".../Movie.2020.eng.forced.srt", ".../forced/eng.srt.gz").
+const FORCED_URL_RE = /(?:^|[._\-/])forced(?:[._\-/]|\.[a-z]+(?:\.gz)?$)/i;
+
+function isLikelyForcedUrl(url) {
+  return Boolean(url) && FORCED_URL_RE.test(String(url));
+}
+
 async function fetchSubtitleContent(url, languageCode = null) {
+  if (isLikelyForcedUrl(url)) {
+    debugServer.log(`Skipping forced subtitle by URL pattern: ${sanitizeForLogging(url)}`);
+    return null;
+  }
+
   try {
     const response = await fetchWithRetry(url, {
       responseType: 'arraybuffer',
@@ -278,6 +277,13 @@ async function fetchSubtitleContent(url, languageCode = null) {
         debugServer.error('Error decompressing gzip:', sanitizeForLogging(e.message));
         return null;
       }
+    }
+
+    if (buffer.length > MAX_DECOMPRESSED_BYTES) {
+      debugServer.warn(
+        `Subtitle exceeds decompressed cap (${buffer.length} > ${MAX_DECOMPRESSED_BYTES}); rejecting`
+      );
+      return null;
     }
 
     const text = decodeSubtitleBuffer(buffer, languageCode);
@@ -432,7 +438,89 @@ function normalizeVttToSrt(text) {
 }
 
 /**
- * Parse SRT text into subtitle objects. Also handles VTT input.
+ * Convert ASS/SSA subtitle format to SRT-compatible text.
+ *
+ * ASS timing: H:MM:SS.cc (centiseconds, NOT milliseconds).
+ * The Text column is field 9 (0-indexed) in the Dialogue line.
+ * Override tags like {\an8}, {\pos(...)}, {\c&H...&} are stripped.
+ */
+function normalizeAssToSrt(text) {
+  const lines = text.split('\n');
+  const output = [];
+  let inEvents = false;
+  let formatFields = null;
+  let cueIndex = 0;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (line === '[Events]') {
+      inEvents = true;
+      continue;
+    }
+    if (line.startsWith('[') && line.endsWith(']')) {
+      inEvents = false;
+      formatFields = null;
+      continue;
+    }
+
+    if (!inEvents) continue;
+
+    if (line.startsWith('Format:')) {
+      formatFields = line.slice('Format:'.length).split(',').map(f => f.trim().toLowerCase());
+      continue;
+    }
+
+    if (!line.startsWith('Dialogue:')) continue;
+
+    // Split: "Dialogue: " + 9 comma-separated fields, last = Text (may contain commas)
+    const rest = line.slice('Dialogue:'.length).trimStart();
+    const parts = rest.split(',');
+    if (parts.length < 10) continue;
+
+    const startRaw = parts[1].trim();
+    const endRaw = parts[2].trim();
+    const textRaw = parts.slice(9).join(',');
+
+    // Convert H:MM:SS.cc → H:MM:SS,mmm (centiseconds → milliseconds)
+    function assTimeToSrt(t) {
+      const m = t.match(/(\d+):(\d{2}):(\d{2})\.(\d{2})/);
+      if (!m) return null;
+      const ms = parseInt(m[4], 10) * 10;
+      return `${m[1].padStart(2, '0')}:${m[2]}:${m[3]},${String(ms).padStart(3, '0')}`;
+    }
+
+    const startSrt = assTimeToSrt(startRaw);
+    const endSrt = assTimeToSrt(endRaw);
+    if (!startSrt || !endSrt) continue;
+
+    // Strip ASS override blocks, drawing commands, and hard line-break tags
+    const cleanText = textRaw
+      .replace(/\{[^}]*\}/g, '')    // {\an8}, {\pos(...)}, {\1c&H...&}, etc.
+      .replace(/\\N/g, '\n')        // soft line breaks
+      .replace(/\\n/g, '\n')
+      .replace(/\\h/g, ' ')         // non-breaking space
+      .trim();
+
+    if (!cleanText) continue;
+
+    cueIndex++;
+    output.push(String(cueIndex));
+    output.push(`${startSrt} --> ${endSrt}`);
+    output.push(cleanText);
+    output.push('');
+  }
+
+  return output.join('\n');
+}
+
+function isAssFormat(text) {
+  const first = text.trimStart().slice(0, 200);
+  return /^\[Script Info\]/i.test(first) || /^\[V4/i.test(first);
+}
+
+/**
+ * Parse SRT text into subtitle objects. Also handles VTT and ASS/SSA input.
  */
 function parseSrt(srtText) {
   if (!srtText || typeof srtText !== 'string') return null;
@@ -446,10 +534,12 @@ function parseSrt(srtText) {
       srtText = srtText.substring(1);
     }
 
-    // Detect and convert VTT format
+    // Detect and convert VTT or ASS/SSA format
     const trimmed = srtText.trimStart();
     if (trimmed.startsWith('WEBVTT')) {
       srtText = normalizeVttToSrt(srtText);
+    } else if (isAssFormat(srtText)) {
+      srtText = normalizeAssToSrt(srtText);
     }
     
     // Normalize period-separated timestamps to comma-separated for the parser
@@ -463,11 +553,28 @@ function parseSrt(srtText) {
     
     if (!Array.isArray(parsed) || parsed.length === 0) return null;
 
-    // Filter out ads
-    const adKeywords = ['OpenSubtitles.org', 'OpenSubtitles.com', 'osdb.link', 'Advertise your'];
-    const filtered = parsed.filter(sub => 
-      !adKeywords.some(keyword => (sub.text || '').includes(keyword))
-    );
+    // Filter out subtitle-pack ad lines so they don't appear in the dual track.
+    const adKeywords = [
+      'opensubtitles.org',
+      'opensubtitles.com',
+      'osdb.link',
+      'advertise your',
+      'subscene.com',
+      'subscene.net',
+      'yifysubtitles',
+      'addic7ed.com',
+      'support us and become vip',
+      'please rate this subtitle',
+      'api.opensubtitles'
+    ];
+    const filtered = parsed.filter(sub => {
+      const text = (sub.text || '').toLowerCase();
+      if (adKeywords.some(keyword => text.includes(keyword))) return false;
+      // Pure-SDH cues only confuse cross-language alignment; the secondary
+      // language almost never has a peer for "[door slams]".
+      if (isPureSdhCueText(sub.text)) return false;
+      return true;
+    });
 
     return filtered;
   } catch (error) {
@@ -497,6 +604,42 @@ function joinSubtitleLines(text, langCode) {
   return text.replace(/\r?\n|\r/g, cjk ? '' : ' ').trim();
 }
 
+// Inline ASS/SSA override blocks (e.g. {\an8}, {\pos(100,200)}, {\fad(0,200)})
+// occasionally leak into .srt files and render as visible junk. They are not
+// HTML so sanitize-html doesn't touch them.
+function stripAssOverrideTags(text) {
+  if (!text) return '';
+  return String(text).replace(/\{\\[^}]*\}/g, '');
+}
+
+// Strip music notation glyphs but keep the lyrics — the secondary language
+// usually has the same lyrics, so we still want them paired.
+function stripMusicMarkers(text) {
+  if (!text) return '';
+  return String(text).replace(/[♪♫]/g, '');
+}
+
+// A cue is "pure SDH" when every non-empty line is just a square-bracketed
+// sound description like "[door slams]" or "[ENGINE REVVING]". These have no
+// peer in the other language and only add noise to the alignment.
+//
+// Parenthetical content stays — it is sometimes used for whispered/quoted
+// dialogue and is too ambiguous to drop reliably.
+const PURE_SDH_LINE_RE = /^\s*\[[^\]]*\]\s*$/;
+
+function isPureSdhCueText(text) {
+  if (!text) return false;
+  const lines = String(text).split(/\r?\n/);
+  let hasAny = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    hasAny = true;
+    if (!PURE_SDH_LINE_RE.test(trimmed)) return false;
+  }
+  return hasAny;
+}
+
 function decodeSubtitleEntities(text) {
   if (!text) return '';
   return String(text)
@@ -516,10 +659,138 @@ function decodeSubtitleEntities(text) {
 }
 
 function cleanSubtitleText(text, langCode) {
-  return joinSubtitleLines(
-    decodeSubtitleEntities(sanitize(text || '', { allowedTags: [], allowedAttributes: {} })),
-    langCode
-  );
+  const withoutAss = stripAssOverrideTags(text || '');
+  const sanitized = sanitize(withoutAss, { allowedTags: [], allowedAttributes: {} });
+  const decoded = decodeSubtitleEntities(sanitized);
+  const withoutMusic = stripMusicMarkers(decoded);
+  return joinSubtitleLines(withoutMusic, langCode);
+}
+
+// Multi-sentence cue splitter ------------------------------------------------
+//
+// Some subtitle releases pack multiple sentences into one long cue while the
+// peer-language release uses one cue per sentence. The bipartite matcher
+// then assigns the long packed cue to exactly one main cue, producing the
+// "two Arabic sentences glued under one English line" failure mode visible
+// in the rendered SRT.
+//
+// We pre-split cues whose timing spans multiple full sentences before
+// alignment runs, so the matcher sees comparable cue boundaries on both
+// sides. The split is conservative: only long cues with clean sentence
+// boundaries and substantial resulting segments are split. "Rapid-fire
+// dialogue" cues (short duration with multiple sentences) are left alone.
+
+const SENTENCE_END_RE = /[.!?؟。]/;
+// Characters that plausibly start a new sentence. Cased scripts (Latin,
+// Cyrillic, Greek) require uppercase; non-cased scripts accept any letter
+// in their block.
+const SENTENCE_START_RE = new RegExp(
+  '[A-ZÀ-ÞĀ-ſ'   // Latin uppercase + extended
+  + 'А-Я'                  // Cyrillic uppercase
+  + 'Α-Ω'                  // Greek uppercase
+  + '؀-ۿ'                  // Arabic
+  + '֐-׿'                  // Hebrew
+  + 'ऀ-ॿ'                  // Devanagari
+  + '฀-๿'                  // Thai
+  + '一-鿿'                  // CJK Unified Ideographs
+  + '぀-ゟ゠-ヿ'     // Hiragana + Katakana
+  + '가-힯'                  // Hangul
+  + ']'
+);
+
+const SPLIT_MIN_DURATION_MS = 2500;
+// 15 is empirically the sweet spot: rejects abbreviation splits ("Mr.",
+// "Dr." → 2-3 char "segments") while accepting genuinely short sentences
+// like "I was eating." or the trailing half of an Arabic cue.
+const SPLIT_MIN_SEGMENT_CHARS = 15;
+
+/**
+ * Split a cue's text at sentence boundaries. A "boundary" is a
+ * sentence-terminator (`.`, `?`, `!`, `؟`, `。`) followed by whitespace
+ * and a sentence-start character.
+ *
+ * Returns the original text as a single-element array if no boundary
+ * passes the strict lookahead — this is the common case.
+ */
+function splitIntoSentences(text) {
+  if (!text) return [];
+  const segments = [];
+  let cursor = 0;
+  let i = 0;
+  while (i < text.length) {
+    if (!SENTENCE_END_RE.test(text[i])) {
+      i++;
+      continue;
+    }
+    let j = i + 1;
+    while (j < text.length && /\s/.test(text[j])) j++;
+    if (j >= text.length) break;
+    if (!SENTENCE_START_RE.test(text[j])) {
+      i++;
+      continue;
+    }
+    const segment = text.slice(cursor, i + 1).trim();
+    if (segment) segments.push(segment);
+    cursor = j;
+    i = j;
+  }
+  const tail = text.slice(cursor).trim();
+  if (tail) segments.push(tail);
+  return segments;
+}
+
+/**
+ * Split each multi-sentence cue into one cue per sentence, distributing
+ * the original timing proportionally to character count. Cues that don't
+ * meet all guards are passed through unchanged so this transform never
+ * regresses well-formed releases.
+ *
+ * Guards (all required, tunable via options):
+ *   • cue duration ≥ minDurationMs (rapid-fire dialogue stays whole)
+ *   • text length ≥ 2 × minSegmentChars (skip trivially short cues)
+ *   • every resulting segment ≥ minSegmentChars (rejects abbreviation
+ *     splits like "Mr. Smith")
+ */
+function splitMultiSentenceCues(subs, options = {}) {
+  const minDurationMs = options.minDurationMs != null
+    ? options.minDurationMs : SPLIT_MIN_DURATION_MS;
+  const minSegmentChars = options.minSegmentChars != null
+    ? options.minSegmentChars : SPLIT_MIN_SEGMENT_CHARS;
+
+  const out = [];
+  if (!Array.isArray(subs)) return out;
+
+  for (const sub of subs) {
+    if (!sub) continue;
+    const dur = (sub.endMs || 0) - (sub.startMs || 0);
+    const text = sub.text || '';
+    if (dur < minDurationMs || text.length < 2 * minSegmentChars) {
+      out.push(sub);
+      continue;
+    }
+    const segments = splitIntoSentences(text);
+    if (segments.length < 2 || segments.some(s => s.length < minSegmentChars)) {
+      out.push(sub);
+      continue;
+    }
+    const totalChars = segments.reduce((sum, s) => sum + s.length, 0);
+    let cursor = sub.startMs;
+    for (let i = 0; i < segments.length; i++) {
+      const isLast = i === segments.length - 1;
+      const portion = segments[i].length / totalChars;
+      const endMs = isLast
+        ? sub.endMs
+        : Math.min(cursor + Math.max(1, Math.round(dur * portion)), sub.endMs - 1);
+      out.push({
+        ...sub,
+        startMs: cursor,
+        endMs,
+        text: segments[i]
+      });
+      cursor = endMs;
+    }
+  }
+  return out;
 }
 
 /** Escape text embedded in SRT HTML tags (avoid breaking markup / injection). */
@@ -592,7 +863,16 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
     transTimed.push({ ...s, startMs, endMs });
   }
 
-  const alignment = alignAndMatch(mainTimed, transTimed, {
+  // Pre-alignment cue splitting: when one side packs multiple sentences
+  // into a long cue while the peer side uses one cue per sentence, the
+  // bipartite matcher binds the long packed cue to a single main and
+  // renders both peer-language sentences under it. Splitting both sides
+  // at sentence boundaries (with guards so it only fires on long, clearly
+  // multi-sentence cues) lets the matcher pair them one-to-one.
+  const mainTimedSplit = splitMultiSentenceCues(mainTimed);
+  const transTimedSplit = splitMultiSentenceCues(transTimed);
+
+  const alignment = alignAndMatch(mainTimedSplit, transTimedSplit, {
     enableOffset,
     enableDrift,
     matchThreshold: matchThresholdMs,
@@ -604,8 +884,8 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
   const transJoiner = isCjkLanguage(transLang) ? '' : ' ';
   const mergedSubs = [];
 
-  for (let mi = 0; mi < mainTimed.length; mi++) {
-    const mainSub = mainTimed[mi];
+  for (let mi = 0; mi < mainTimedSplit.length; mi++) {
+    const mainSub = mainTimedSplit[mi];
 
     const cleanMainText = cleanSubtitleText(mainSub.text, mainLang);
     if (!cleanMainText) continue;
@@ -615,7 +895,7 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
     if (transIdxs && transIdxs.length > 0) {
       const transParts = [];
       for (const ti of transIdxs) {
-        const t = transTimed[ti];
+        const t = transTimedSplit[ti];
         if (!t) continue;
         const piece = cleanSubtitleText(t.text, transLang);
         if (piece) transParts.push(piece);
@@ -635,11 +915,20 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
 
     if (!mergedText) continue;
 
+    // Output timing always follows the primary (main) cue. Split-derived
+    // cues carry the proportionally-divided startMs/endMs from
+    // splitMultiSentenceCues; original cues carry their parsed timings.
+    // We re-derive the SRT strings from the ms values so split cues get
+    // their new boundaries instead of inheriting the parent cue's strings.
     let outputStartTime = mainSub.startTime;
     let outputEndTime = mainSub.endTime;
+    if (Number.isFinite(mainSub.startMs) && Number.isFinite(mainSub.endMs)) {
+      outputStartTime = msToSrtTime(mainSub.startMs);
+      outputEndTime = msToSrtTime(mainSub.endMs);
+    }
     if (renderTimingSource === 'secondary' && transIdxs && transIdxs.length > 0) {
       const timingSubs = transIdxs
-        .map(ti => transTimed[ti])
+        .map(ti => transTimedSplit[ti])
         .filter(Boolean);
       if (timingSubs.length > 0) {
         const startMs = Math.min(...timingSubs.map(t => t.startMs));
@@ -672,7 +961,7 @@ function mergeSubtitles(mainSubs, transSubs, options = {}) {
       drift: alignment.drift,
       localAnchors: alignment.localAnchors,
       matchedCount: matches.size,
-      mainCount: mainTimed.length,
+      mainCount: mainTimedSplit.length,
       timingSource: renderTimingSource
     },
     enumerable: false
@@ -697,24 +986,30 @@ function formatSrt(subtitleArray) {
 // In-memory cache for merged subtitles
 const subtitleCache = new Map();
 const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours
+const CACHE_SWEEP_INTERVAL_MS = 15 * 60 * 1000; // sweep at most every 15 min
+let lastCacheSweep = 0;
+
+function sweepSubtitleCache(now) {
+  for (const [k, v] of subtitleCache) {
+    if (now - v.timestamp > CACHE_TTL) subtitleCache.delete(k);
+  }
+  lastCacheSweep = now;
+}
+
+function maybeSweepSubtitleCache(now) {
+  if (now - lastCacheSweep > CACHE_SWEEP_INTERVAL_MS) sweepSubtitleCache(now);
+}
 
 /**
  * Store subtitle in cache and return data URL.
  */
 function storeSubtitle(key, srtContent) {
-  // Clean old entries
   const now = Date.now();
-  for (const [k, v] of subtitleCache.entries()) {
-    if (now - v.timestamp > CACHE_TTL) {
-      subtitleCache.delete(k);
-    }
-  }
-
+  sweepSubtitleCache(now);
   subtitleCache.set(key, {
     content: srtContent,
     timestamp: now
   });
-
   return key;
 }
 
@@ -722,14 +1017,17 @@ function storeSubtitle(key, srtContent) {
  * Get subtitle from cache.
  */
 function getSubtitle(key) {
+  const now = Date.now();
+  maybeSweepSubtitleCache(now);
+
   const entry = subtitleCache.get(key);
   if (!entry) return null;
-  
-  if (Date.now() - entry.timestamp > CACHE_TTL) {
+
+  if (now - entry.timestamp > CACHE_TTL) {
     subtitleCache.delete(key);
     return null;
   }
-  
+
   return entry.content;
 }
 
@@ -752,7 +1050,10 @@ function getSubtitle(key) {
  * } | null>}
  */
 async function selectAndMergeBestPair(candidatePairs, mainLang, transLang, options = {}) {
-  if (!Array.isArray(candidatePairs) || candidatePairs.length === 0) return null;
+  if (!Array.isArray(candidatePairs) || candidatePairs.length === 0) {
+    // If no pairs exist, try translating-only path below
+    return tryTranslatorFallback(null, null, mainLang, transLang, options);
+  }
   const timingSource = normalizeTimingSource(options.timingSource);
 
   const parsedCache = new Map();
@@ -778,12 +1079,18 @@ async function selectAndMergeBestPair(candidatePairs, mainLang, transLang, optio
       getParsed(pair.main, mainLang),
       getParsed(pair.trans, transLang)
     ]);
-    if (!mainParsed || mainParsed.length === 0) {
-      debugServer.warn(`  main subtitle ${pair.main.id} unparsable, skipping`);
+    if (!mainParsed || mainParsed.length < MIN_USABLE_CUES) {
+      debugServer.warn(
+        `  main subtitle ${pair.main.id} unusable ` +
+        `(${mainParsed ? mainParsed.length : 0} cues), skipping`
+      );
       continue;
     }
-    if (!transParsed || transParsed.length === 0) {
-      debugServer.warn(`  trans subtitle ${pair.trans.id} unparsable, skipping`);
+    if (!transParsed || transParsed.length < MIN_USABLE_CUES) {
+      debugServer.warn(
+        `  trans subtitle ${pair.trans.id} unusable ` +
+        `(${transParsed ? transParsed.length : 0} cues), skipping`
+      );
       continue;
     }
 
@@ -814,80 +1121,60 @@ async function selectAndMergeBestPair(candidatePairs, mainLang, transLang, optio
       `matchRate=${(best.matchRate * 100).toFixed(1)}% attempts=${best.attempts} ` +
       `passedGate=${best.passedGate}`
     );
+    return best;
   }
-  return best;
+
+  // No usable pair found — try translating the best available main subtitle
+  const bestMainSub = candidatePairs.length > 0 ? candidatePairs[0].main : null;
+  return tryTranslatorFallback(bestMainSub, parsedCache, mainLang, transLang, options);
 }
 
-async function translatePrimarySubtitleEntries(mainParsed, mainLang, transLang, options = {}) {
-  const sourceTexts = [];
-  const sourceIndexes = [];
+/**
+ * When no secondary subtitle is available, translate the primary track using
+ * LibreTranslate. Returns the same shape as selectAndMergeBestPair results.
+ */
+async function tryTranslatorFallback(mainSub, parsedCache, mainLang, transLang, options = {}) {
+  const env = options.env || process.env;
+  if (!isTranslatorAvailable(env)) return null;
 
-  for (let i = 0; i < mainParsed.length; i++) {
-    const cleanText = cleanSubtitleText(mainParsed[i].text, mainLang);
-    if (!cleanText) continue;
-    sourceIndexes.push(i);
-    sourceTexts.push(cleanText);
+  debugServer.log(`No trans subtitle found; attempting local translation (${mainLang}→${transLang})`);
+
+  let mainParsed = null;
+  if (mainSub) {
+    const cached = parsedCache && parsedCache.get(mainSub.id);
+    if (cached && cached.length >= MIN_USABLE_CUES) {
+      mainParsed = cached;
+    } else {
+      const content = await fetchSubtitleContent(mainSub.url, mainLang);
+      mainParsed = content ? parseSrt(content) : null;
+    }
   }
 
-  if (sourceTexts.length === 0) return [];
-
-  const translatedTexts = await translateTexts(sourceTexts, {
-    sourceLang: mainLang,
-    targetLang: transLang,
-    env: options.env || process.env,
-    request: options.translationRequest,
-    timeout: options.translationTimeout
-  });
-
-  const translatedByIndex = new Map();
-  for (let i = 0; i < sourceIndexes.length; i++) {
-    translatedByIndex.set(sourceIndexes[i], translatedTexts[i] || '');
-  }
-
-  return mainParsed.map((sub, index) => ({
-    ...sub,
-    text: translatedByIndex.get(index) || ''
-  }));
-}
-
-async function generateTranslatedPrimarySubtitle(mainSub, mainLang, transLang, options = {}) {
-  if (!isTranslationConfigured(options.env || process.env)) {
-    debugServer.warn('Machine translation requested but translation is not configured');
+  if (!mainParsed || mainParsed.length < MIN_USABLE_CUES) {
+    debugServer.warn('No usable main subtitle for translation fallback');
     return null;
   }
 
-  const content = await fetchSubtitleContent(mainSub.url, mainLang);
-  const mainParsed = content ? parseSrt(content) : null;
-  if (!mainParsed || mainParsed.length === 0) {
-    debugServer.warn(`Primary subtitle ${mainSub.id} unparsable for translation`);
+  const timingSource = normalizeTimingSource(options.timingSource);
+  const translated = await translateSubtitles(mainParsed, mainLang, transLang, fetchWithRetry, env);
+  if (!translated) {
+    debugServer.warn('Local translation returned no output');
     return null;
   }
 
-  const translatedSubs = await translatePrimarySubtitleEntries(mainParsed, mainLang, transLang, options);
-  if (!translatedSubs || translatedSubs.length === 0) {
-    debugServer.warn(`Primary subtitle ${mainSub.id} produced no translatable text`);
-    return null;
-  }
+  debugServer.log(`Translated ${translated.length} cues (${mainLang}→${transLang}) via LibreTranslate`);
 
-  const merged = mergeSubtitles(mainParsed, translatedSubs, {
-    mainLang,
-    transLang,
-    timingSource: 'primary',
-    allowMultiTrans: false,
-    enableOffset: false,
-    enableDrift: false
-  });
-
-  if (!merged || merged.length === 0) return null;
-
+  // The translated cues share exact timing with main — merge is trivially 100%
+  const merged = mergeSubtitles(mainParsed, translated, { mainLang, transLang, timingSource });
   return {
     merged,
-    mergedSrt: formatSrt(merged),
-    matchRate: merged.matchRate != null ? merged.matchRate : 1,
-    mainSub,
-    transSub: null,
+    mergedSrt: merged && merged.length > 0 ? formatSrt(merged) : null,
+    matchRate: 1.0,
+    mainSub: mainSub || { id: 'translated' },
+    transSub: { id: `translated-${mainLang}-${transLang}` },
     attempts: 1,
-    passedGate: true
+    passedGate: true,
+    translatedLocally: true
   };
 }
 
@@ -895,9 +1182,14 @@ async function generateTranslatedPrimarySubtitle(mainSub, mainLang, transLang, o
 async function subtitlesHandler({ type, id, extra, config }) {
   debugServer.log('Subtitle request:', sanitizeForLogging({ type, id }));
 
-  // Get configured languages
+  // Get configured languages and any per-request API key overrides
   const mainLangRaw = config?.mainLang || 'English [eng]';
   const transLangRaw = config?.transLang || 'Turkish [tur]';
+  const envOverrides = (config?.envOverrides && typeof config.envOverrides === 'object')
+    ? config.envOverrides : {};
+  const requestEnv = Object.keys(envOverrides).length > 0
+    ? { ...process.env, ...envOverrides }
+    : process.env;
 
   const mainLang = parseLangCode(mainLangRaw);
   const transLang = parseLangCode(transLangRaw);
@@ -910,24 +1202,34 @@ async function subtitlesHandler({ type, id, extra, config }) {
     return { subtitles: [] };
   }
 
-  // Parse IMDB ID
-  let imdbId = extra?.imdbId || id;
-  let season = extra?.season;
-  let episode = extra?.episode;
+  // Parse ID — may be IMDb ("tt1234567", "tt1234567:1:5") or Kitsu ("kitsu:12345", "kitsu:12345:1:5")
+  const rawId = extra?.imdbId || id;
+  let imdbId = null;
+  let kitsuId = null;
+  let season = extra?.season || null;
+  let episode = extra?.episode || null;
 
-  if (imdbId.includes(':')) {
-    const parts = imdbId.split(':');
-    imdbId = parts[0];
-    if (parts.length >= 3) {
-      season = season || parts[1];
-      episode = episode || parts[2];
+  const kitsuParsed = parseKitsuId(rawId);
+  if (kitsuParsed) {
+    kitsuId = kitsuParsed.kitsuId;
+    season = season || kitsuParsed.season;
+    episode = episode || kitsuParsed.episode;
+  } else {
+    // IMDb path (possibly colon-separated series ID)
+    let parsed = rawId;
+    if (parsed.includes(':')) {
+      const parts = parsed.split(':');
+      parsed = parts[0];
+      if (parts.length >= 3) {
+        season = season || parts[1];
+        episode = episode || parts[2];
+      }
     }
+    imdbId = parsed.replace(/^tt/i, '') || null;
   }
 
-  imdbId = imdbId.replace('tt', '');
-
-  if (!imdbId) {
-    debugServer.warn('No valid IMDB ID');
+  if (!imdbId && !kitsuId) {
+    debugServer.warn('No valid IMDb or Kitsu ID');
     return { subtitles: [] };
   }
 
@@ -943,7 +1245,7 @@ async function subtitlesHandler({ type, id, extra, config }) {
       season,
       episode,
       videoParams,
-      { languages: [mainLang, transLang] }
+      { languages: [mainLang, transLang], kitsuId, env: requestEnv }
     );
 
     if (!allSubtitles) {
@@ -953,7 +1255,7 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
     debugServer.log(`Found ${allSubtitles.length} total subtitles`);
 
-    const mainCandidates = rankCandidatesForLanguage(allSubtitles, mainLang);
+    const mainCandidates = rankCandidatesForLanguage(allSubtitles, mainLang, { videoParams });
     if (mainCandidates.length === 0) {
       debugServer.warn(`No ${mainLang} subtitle candidates available`);
       return { subtitles: [] };
@@ -961,8 +1263,11 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
     // Build the ordered list of (main, trans) candidates. Same-`g`
     // (same release) pairs come first; this is our biggest single
-    // accuracy win on titles like Sopranos S01E03.
-    const candidatePairs = generateCandidatePairs(allSubtitles, mainLang, transLang);
+    // accuracy win on titles like Sopranos S01E03. Passing videoParams
+    // also lets the ranker prefer hash-matched and filename-matching subs.
+    const candidatePairs = generateCandidatePairs(
+      allSubtitles, mainLang, transLang, { videoParams }
+    );
 
     debugServer.log(
       `Built ${candidatePairs.length} candidate pair(s); ` +
@@ -979,12 +1284,21 @@ async function subtitlesHandler({ type, id, extra, config }) {
     const finalSubtitles = [];
     const best = candidatePairs[0];
 
-    if (best) {
+    // For Kitsu anime, encode the Kitsu ID as "kitsu-{id}" in the URL's
+    // imdbId segment so generateDynamicSubtitle can resolve it back.
+    const urlImdbId = imdbId || (kitsuId ? `kitsu-${kitsuId}` : null);
+
+    if (best && urlImdbId) {
+      // Only the primary-timing variant is published. mergeSubtitles still
+      // accepts `timingSource: 'secondary'` for legacy URLs, but exposing
+      // both variants confused users — secondary timing makes the merged
+      // cue follow the trans cue, which combines with packed cues to
+      // produce the "two sentences glued under one line" failure mode.
       finalSubtitles.push({
-        id: `dual-${best.main.id}-${best.trans.id}-primary-time`,
+        id: `dual-${best.main.id}-${best.trans.id}`,
         url: buildDynamicSubtitleUrl(
           type,
-          imdbId,
+          urlImdbId,
           season,
           episode,
           mainLang,
@@ -995,23 +1309,7 @@ async function subtitlesHandler({ type, id, extra, config }) {
           { timingSource: 'primary' }
         ),
         lang: mainLang,
-        SubtitlesName: `${subtitleTitle} (Primary timing)`
-      }, {
-        id: `dual-${best.main.id}-${best.trans.id}-secondary-time`,
-        url: buildDynamicSubtitleUrl(
-          type,
-          imdbId,
-          season,
-          episode,
-          mainLang,
-          transLang,
-          best.main.id,
-          best.trans.id,
-          videoParams,
-          { timingSource: 'secondary' }
-        ),
-        lang: mainLang,
-        SubtitlesName: `${subtitleTitle} (Secondary timing)`
+        SubtitlesName: subtitleTitle
       });
 
       debugServer.log(
@@ -1020,27 +1318,6 @@ async function subtitlesHandler({ type, id, extra, config }) {
       );
     } else {
       debugServer.warn(`No ${mainLang}/${transLang} candidate pairs available`);
-    }
-
-    if (isTranslationConfigured()) {
-      const bestMain = best ? best.main : mainCandidates[0];
-      finalSubtitles.push({
-        id: `dual-${bestMain.id}-translate-primary`,
-        url: buildDynamicSubtitleUrl(
-          type,
-          imdbId,
-          season,
-          episode,
-          mainLang,
-          transLang,
-          bestMain.id,
-          'translated',
-          videoParams,
-          { mode: 'translate-primary' }
-        ),
-        lang: mainLang,
-        SubtitlesName: `${subtitleTitle} (Translate primary)`
-      });
     }
 
     if (finalSubtitles.length === 0) return { subtitles: [] };
@@ -1082,15 +1359,20 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
     return cached;
   }
 
+  // Decode Kitsu ID encoded in imdbId segment ("kitsu-12345" → kitsuId="12345")
+  const kitsuMatch = imdbId && imdbId.startsWith('kitsu-') ? imdbId.slice('kitsu-'.length) : null;
+  const resolvedImdbId = kitsuMatch ? null : imdbId;
+  const resolvedKitsuId = kitsuMatch || null;
+
   try {
     // Fetch all subtitles
     const allSubtitles = await fetchAllSubtitles(
-      imdbId, 
-      type, 
-      season !== '0' ? season : null, 
+      resolvedImdbId,
+      type,
+      season !== '0' ? season : null,
       episode !== '0' ? episode : null,
       normalizedVideoParams,
-      { languages: subtitleMode === 'translate-primary' ? [mainLang] : [mainLang, transLang] }
+      { languages: [mainLang, transLang], kitsuId: resolvedKitsuId }
     );
 
     if (!allSubtitles) {
@@ -1098,31 +1380,13 @@ async function generateDynamicSubtitle(type, imdbId, season, episode, mainLang, 
       return null;
     }
 
-    if (subtitleMode === 'translate-primary') {
-      const requestedMain = allSubtitles.find(s => String(s.id) === String(mainSubId));
-      const mainSub = requestedMain || rankCandidatesForLanguage(allSubtitles, mainLang)[0];
-      if (!mainSub) {
-        debugServer.warn('No primary subtitle available for translation');
-        return null;
-      }
-
-      const translated = await generateTranslatedPrimarySubtitle(mainSub, mainLang, transLang, options);
-      if (!translated || !translated.mergedSrt) {
-        debugServer.warn('Could not generate translated-primary subtitle');
-        return null;
-      }
-
-      debugServer.log(
-        `Generated ${translated.merged.length} translated-primary subtitle entries`
-      );
-      storeSubtitle(cacheKey, translated.mergedSrt);
-      return translated.mergedSrt;
-    }
-
     // Build candidate pairs for this title; we'll start by trying the
     // exact pair encoded in the URL (the one subtitlesHandler picked),
     // then fall back to other candidates if the match rate is too low.
-    const candidatePairs = generateCandidatePairs(allSubtitles, mainLang, transLang);
+    const candidatePairs = generateCandidatePairs(
+      allSubtitles, mainLang, transLang,
+      { videoParams: normalizedVideoParams }
+    );
 
     const requestedMain = allSubtitles.find(s => String(s.id) === String(mainSubId));
     const requestedTrans = allSubtitles.find(s => String(s.id) === String(transSubId));
@@ -1189,6 +1453,8 @@ module.exports = {
     parseSrt,
     parseSrtSimple,
     normalizeVttToSrt,
+    normalizeAssToSrt,
+    isAssFormat,
     mergeSubtitles,
     joinSubtitleLines,
     formatSrt,
@@ -1203,8 +1469,14 @@ module.exports = {
     fetchAllSubtitles,
     getEnabledSubtitleSources,
     getSubtitleSourceSummary,
-    translatePrimarySubtitleEntries,
     decodeSubtitleEntities,
-    cleanSubtitleText
+    cleanSubtitleText,
+    isLikelyForcedUrl,
+    isPureSdhCueText,
+    stripAssOverrideTags,
+    stripMusicMarkers,
+    splitIntoSentences,
+    splitMultiSentenceCues,
+    MIN_USABLE_CUES
   }
 };

@@ -24,10 +24,25 @@ const {
     buildDynamicSubtitleUrl,
     normalizeTimingSource,
     normalizeSubtitleMode,
-    decodeSubtitleEntities
+    decodeSubtitleEntities,
+    cleanSubtitleText,
+    isLikelyForcedUrl,
+    isPureSdhCueText,
+    stripAssOverrideTags,
+    stripMusicMarkers,
+    splitIntoSentences,
+    splitMultiSentenceCues,
+    normalizeAssToSrt,
+    isAssFormat
   },
   manifest
 } = require('./addon');
+
+const { parseKitsuId } = require('./lib/animeSource');
+// Prevent server.js from binding a port when required for tests
+process.env.VERCEL = '1';
+const { _test: { parseConfigParam } } = require('./server');
+delete process.env.VERCEL;
 
 const {
   isCjkLanguage,
@@ -172,6 +187,32 @@ test('SRT ad lines are filtered out', () => {
   assert.ok(result);
   assert.strictEqual(result.length, 1);
   assert.strictEqual(result[0].text, 'Hello');
+});
+
+test('SRT: pure-SDH bracketed cues are dropped', () => {
+  const srt =
+    '1\n00:00:01,000 --> 00:00:04,000\n[door slams]\n\n' +
+    '2\n00:00:05,000 --> 00:00:08,000\nReal dialogue\n\n' +
+    '3\n00:00:09,000 --> 00:00:12,000\n[ENGINE REVVING]\n';
+  const result = parseSrt(srt);
+  assert.ok(result);
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].text, 'Real dialogue');
+});
+
+test('SRT: bracketed text mixed with dialogue is kept', () => {
+  const srt = '1\n00:00:01,000 --> 00:00:04,000\n[softly] Come closer\n';
+  const result = parseSrt(srt);
+  assert.ok(result);
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].text, '[softly] Come closer');
+});
+
+test('SRT: parenthetical-only cues stay (ambiguous with whispered dialogue)', () => {
+  const srt = '1\n00:00:01,000 --> 00:00:04,000\n(don\'t tell anyone)\n';
+  const result = parseSrt(srt);
+  assert.ok(result);
+  assert.strictEqual(result.length, 1);
 });
 
 test('Empty/null input returns null', () => {
@@ -543,23 +584,6 @@ test('buildDynamicSubtitleUrl can request secondary subtitle timing', () => {
   assert.ok(url.includes('timingSource=secondary'));
 });
 
-test('buildDynamicSubtitleUrl can request translated-primary mode', () => {
-  const url = buildDynamicSubtitleUrl(
-    'movie',
-    '0111161',
-    '0',
-    '0',
-    'eng',
-    'tur',
-    'main-id',
-    'translated',
-    { filename: 'Movie.2020.mkv' },
-    { mode: 'translate-primary' }
-  );
-  assert.ok(url.includes('filename=Movie.2020.mkv'));
-  assert.ok(url.includes('mode=translate-primary'));
-});
-
 test('normalizeTimingSource rejects unknown values', () => {
   assert.strictEqual(normalizeTimingSource('secondary'), 'secondary');
   assert.strictEqual(normalizeTimingSource('embedded'), 'primary');
@@ -568,8 +592,8 @@ test('normalizeTimingSource rejects unknown values', () => {
 });
 
 test('normalizeSubtitleMode rejects unknown values', () => {
-  assert.strictEqual(normalizeSubtitleMode('translate-primary'), 'translate-primary');
   assert.strictEqual(normalizeSubtitleMode('dual'), 'dual');
+  assert.strictEqual(normalizeSubtitleMode('translate-primary'), 'dual');
   assert.strictEqual(normalizeSubtitleMode('translated'), 'dual');
   assert.strictEqual(normalizeSubtitleMode(null), 'dual');
 });
@@ -975,6 +999,143 @@ test('generateCandidatePairs: top ranked main with same-`g` peer wins over highe
   assert.strictEqual(pairs[0].sameGroup, true);
 });
 
+const {
+  _internal: {
+    tokenizeRelease,
+    tokenJaccard,
+    tokenRecall,
+    subReleaseTokens
+  }
+} = require('./lib/sourceSelection');
+
+test('tokenizeRelease: drops extension and short noise', () => {
+  assert.deepStrictEqual(
+    tokenizeRelease('Movie.2020.1080p.WEB-DL.YTS.srt'),
+    ['movie', '2020', '1080p', 'web', 'dl', 'yts']
+  );
+  assert.deepStrictEqual(tokenizeRelease(''), []);
+});
+
+test('tokenJaccard: intersection over union', () => {
+  assert.strictEqual(
+    tokenJaccard(['a', 'b', 'c'], ['b', 'c', 'd']),
+    2 / 4
+  );
+  assert.strictEqual(tokenJaccard([], ['a']), 0);
+});
+
+test('tokenRecall: fraction of user tokens hit by candidate tokens', () => {
+  assert.strictEqual(tokenRecall(['a', 'b'], ['a', 'b', 'c']), 1);
+  assert.strictEqual(tokenRecall(['a', 'b'], ['a']), 0.5);
+  assert.strictEqual(tokenRecall([], ['a']), 0);
+});
+
+test('subReleaseTokens: pulls from _release, _fileName, and URL', () => {
+  const tokens = subReleaseTokens({
+    _release: 'Movie 2020 1080p WEB-DL',
+    _fileName: 'movie.2020.srt',
+    url: 'https://example.com/x/Movie.2020.WEB-DL.srt'
+  });
+  assert.ok(tokens.includes('movie'));
+  assert.ok(tokens.includes('2020'));
+  assert.ok(tokens.includes('1080p'));
+  assert.ok(tokens.includes('web'));
+  assert.ok(tokens.includes('dl'));
+});
+
+test('rankCandidatesForLanguage: hash-match (m !== "i") outranks plain results', () => {
+  // a) imdb-only match, utf8     → 0 + 5 = 5
+  // b) hash match, no encoding   → 50      = 50  ← winner
+  // Even though (a) has the encoding bonus, the hash boost dwarfs it.
+  const subs = [
+    { id: 'a', lang: 'eng', g: '1', SubEncoding: 'UTF-8', m: 'i' },
+    { id: 'b', lang: 'eng', g: '2', SubEncoding: 'UTF-8', m: 'h' }
+  ];
+  const ranked = rankCandidatesForLanguage(subs, 'eng');
+  assert.strictEqual(ranked[0].id, 'b');
+});
+
+test('rankCandidatesForLanguage: filename overlap boosts matching candidate', () => {
+  // (a) has no release info; (b)'s _release shares tokens with the user
+  // filename. (b) should move to the top even though (a) is listed first.
+  const subs = [
+    { id: 'a', lang: 'eng', g: '1', SubEncoding: 'UTF-8', m: 'i' },
+    {
+      id: 'b',
+      lang: 'eng',
+      g: '2',
+      SubEncoding: 'UTF-8',
+      m: 'i',
+      _release: 'Movie.2020.1080p.WEB-DL.YTS'
+    }
+  ];
+  const ranked = rankCandidatesForLanguage(subs, 'eng', {
+    videoParams: { filename: 'Movie.2020.1080p.WEB-DL.YTS.mkv' }
+  });
+  assert.strictEqual(ranked[0].id, 'b');
+});
+
+test('rankCandidatesForLanguage: no filename → existing encoding ranking holds', () => {
+  // Sanity check that adding the new signals didn't regress old ordering.
+  const subs = [
+    { id: 'a', lang: 'eng', g: '1', SubEncoding: 'CP1254', m: 'i' },
+    { id: 'b', lang: 'eng', g: '1', SubEncoding: 'UTF-8',  m: 'i' }
+  ];
+  const ranked = rankCandidatesForLanguage(subs, 'eng');
+  assert.strictEqual(ranked[0].id, 'b');
+});
+
+test('generateCandidatePairs: cross-source same-release pair detected by token overlap', () => {
+  // ENG sub from OpenSubtitles (g='os-7'), TUR sub from Wyzie (g='movie.2020.web.dl').
+  // Their `g` keys don't match, but both have release tokens that overlap.
+  // We expect a `cross-release` pair, not just a zipped fallback.
+  const subs = [
+    {
+      id: 'eng-os',
+      lang: 'eng',
+      g: 'os-7',
+      _release: 'Movie.2020.1080p.WEB-DL'
+    },
+    {
+      id: 'tur-wyzie',
+      lang: 'tur',
+      g: 'movie.2020.1080p.web.dl',
+      _release: 'Movie.2020.1080p.WEB-DL.Podnapisi'
+    }
+  ];
+  const pairs = generateCandidatePairs(subs, 'eng', 'tur');
+  assert.ok(pairs.length >= 1);
+  const crossPair = pairs.find(p => p.source === 'cross-release');
+  assert.ok(crossPair, 'should produce at least one cross-release pair');
+  assert.strictEqual(crossPair.main.id, 'eng-os');
+  assert.strictEqual(crossPair.trans.id, 'tur-wyzie');
+});
+
+test('generateCandidatePairs: strict same-`g` still wins over cross-release', () => {
+  // Make sure the cross-release queue doesn't accidentally outrank the
+  // strict-`g` queue when both exist.
+  const subs = [
+    { id: 'eng-7',  lang: 'eng', g: '7' },
+    { id: 'tur-7',  lang: 'tur', g: '7' },
+    {
+      id: 'eng-cross',
+      lang: 'eng',
+      g: 'os-9',
+      _release: 'Movie.2020.1080p.WEB-DL'
+    },
+    {
+      id: 'tur-cross',
+      lang: 'tur',
+      g: 'wy-9',
+      _release: 'Movie.2020.1080p.WEB-DL.Podnapisi'
+    }
+  ];
+  const pairs = generateCandidatePairs(subs, 'eng', 'tur');
+  assert.strictEqual(pairs[0].source, 'group');
+  assert.strictEqual(pairs[0].main.id, 'eng-7');
+  assert.strictEqual(pairs[0].trans.id, 'tur-7');
+});
+
 // ============================================================================
 // syncEngine — sliding-window local offsets
 // ============================================================================
@@ -1101,6 +1262,8 @@ test('subtitleSources: registers requested source candidates', () => {
   const ids = SUBTITLE_SOURCES.map(source => source.id);
   for (const id of [
     'opensubtitles',
+    'jimaku',
+    'subdl',
     'addic7ed',
     'tvsubtitles',
     'podnapisi',
@@ -1114,13 +1277,18 @@ test('subtitleSources: registers requested source candidates', () => {
   }
 });
 
-test('subtitleSources: only safe default source is enabled without optional keys', () => {
+test('subtitleSources: default sources are enabled without optional keys', () => {
   const enabled = getEnabledSubtitleSources({});
-  assert.deepStrictEqual(enabled.map(source => source.id), ['opensubtitles']);
+  const enabledIds = enabled.map(source => source.id);
+  // opensubtitles and jimaku are both enabled by default.
+  // jimaku returns [] quickly when no anime context is provided, so it's safe to leave on.
+  assert.ok(enabledIds.includes('opensubtitles'), 'opensubtitles should be enabled by default');
+  assert.ok(enabledIds.includes('jimaku'), 'jimaku should be enabled by default for anime support');
 
   const summary = getSubtitleSourceSummary({});
   assert.strictEqual(summary.find(source => source.id === 'opensubtitles').enabled, true);
   assert.strictEqual(summary.find(source => source.id === 'wyzie').enabled, false);
+  assert.strictEqual(summary.find(source => source.id === 'subdl').enabled, false);
   assert.strictEqual(summary.find(source => source.id === 'downsub').enabled, false);
 });
 
@@ -1193,74 +1361,533 @@ test('subtitleSources helpers: normalize language and release keys', () => {
 });
 
 // ============================================================================
-// translation - MyMemory helpers
+// subtitle content filters (forced / SDH / ASS / music)
 // ============================================================================
-console.log('\n--- translation ---');
+console.log('\n--- subtitle content filters ---');
+
+test('isLikelyForcedUrl: detects .forced. in filename', () => {
+  assert.strictEqual(
+    isLikelyForcedUrl('https://example.com/Movie.2020.eng.forced.srt'),
+    true
+  );
+  assert.strictEqual(
+    isLikelyForcedUrl('https://example.com/forced/eng.srt.gz'),
+    true
+  );
+  assert.strictEqual(
+    isLikelyForcedUrl('https://example.com/path/Movie.eng.srt'),
+    false
+  );
+  assert.strictEqual(isLikelyForcedUrl(''), false);
+  assert.strictEqual(isLikelyForcedUrl(null), false);
+});
+
+test('isPureSdhCueText: only drops square-bracketed sound descriptions', () => {
+  assert.strictEqual(isPureSdhCueText('[door slams]'), true);
+  assert.strictEqual(isPureSdhCueText('[ENGINE REVVING]'), true);
+  assert.strictEqual(isPureSdhCueText('[music]\n[crowd noise]'), true);
+  assert.strictEqual(isPureSdhCueText('Real dialogue'), false);
+  assert.strictEqual(isPureSdhCueText('[whisper] Come here'), false);
+  // Parenthetical asides are ambiguous with whispered dialogue — keep them.
+  assert.strictEqual(isPureSdhCueText("(don't tell anyone)"), false);
+  assert.strictEqual(isPureSdhCueText(''), false);
+});
+
+test('stripAssOverrideTags: removes inline {\\...} blocks', () => {
+  assert.strictEqual(
+    stripAssOverrideTags('{\\an8}top text'),
+    'top text'
+  );
+  assert.strictEqual(
+    stripAssOverrideTags('{\\pos(100,200)}{\\fad(0,200)}Hello'),
+    'Hello'
+  );
+  assert.strictEqual(stripAssOverrideTags('No tags here'), 'No tags here');
+});
+
+test('stripMusicMarkers: removes ♪/♫ but keeps the lyrics', () => {
+  assert.strictEqual(
+    stripMusicMarkers('♪ Yesterday all my troubles ♪'),
+    ' Yesterday all my troubles '
+  );
+  assert.strictEqual(stripMusicMarkers('Plain text'), 'Plain text');
+});
+
+test('cleanSubtitleText: strips ASS overrides and music markers end-to-end', () => {
+  assert.strictEqual(
+    cleanSubtitleText('{\\an8}♪ La la la ♪', 'eng').trim(),
+    'La la la'
+  );
+});
+
+// ============================================================================
+// textFeatures
+// ============================================================================
+console.log('\n--- textFeatures ---');
 
 const {
-  buildMyMemoryUrl,
-  buildMyMemoryRequestUrl,
-  isTranslationConfigured,
-  toTranslationLanguageCode,
-  chunkMyMemoryText,
-  normalizeMyMemoryResponse
-} = require('./lib/translation');
+  extractCueFeatures,
+  buildFeatureArray,
+  textSimilarity,
+  digitSimilarity,
+  digitsContradict,
+  punctSimilarity,
+  lengthRatioFit,
+  isHighConfidenceTextMatch
+} = require('./lib/textFeatures');
 
-test('translation: MyMemory provider is enabled without a subscription key', () => {
-  assert.strictEqual(isTranslationConfigured({}), true);
+test('extractCueFeatures: pulls digit tokens, length, punctuation', () => {
+  const f = extractCueFeatures('In 1985 we met at 3:00, right?');
+  assert.deepStrictEqual(f.digits, ['1985', '3:00']);
+  assert.strictEqual(f.punct.q, true);
+  assert.strictEqual(f.punct.excl, false);
+  assert.ok(f.len > 0);
 });
 
-test('translation: builds MyMemory request URL', () => {
-  const url = buildMyMemoryRequestUrl({
-    text: 'Hello world',
-    source: 'en',
-    target: 'tr',
-    env: { MYMEMORY_EMAIL: 'dev@example.com' }
+test('extractCueFeatures: strips HTML, ASS overrides, and music notes', () => {
+  const f = extractCueFeatures('<i>{\\an8}♪ Track 7 ♪</i>');
+  assert.deepStrictEqual(f.digits, ['7']);
+});
+
+test('digitSimilarity: zero when either side has no digits', () => {
+  const a = extractCueFeatures('hello world');
+  const b = extractCueFeatures('1985 era');
+  assert.strictEqual(digitSimilarity(a, b), 0);
+});
+
+test('digitSimilarity: Jaccard of digit token sets', () => {
+  const a = extractCueFeatures('In 1985 and 1990 we met');
+  const b = extractCueFeatures('1985 was the year');
+  // sets: {1985, 1990} ∩ {1985} = 1; union = 2 → 0.5
+  assert.strictEqual(digitSimilarity(a, b), 0.5);
+});
+
+test('digitsContradict: true only when both have digits and none overlap', () => {
+  const a = extractCueFeatures('Apollo 13 launched');
+  const b = extractCueFeatures('Apollo 11 a décollé');
+  assert.strictEqual(digitsContradict(a, b), true);
+
+  const c = extractCueFeatures('no digits here');
+  // c has no digits → no contradiction signal
+  assert.strictEqual(digitsContradict(a, c), false);
+});
+
+test('lengthRatioFit: ~1 for equal lengths, ~0 for 3× differences', () => {
+  const a = extractCueFeatures('hello');
+  const b = extractCueFeatures('world');
+  assert.ok(lengthRatioFit(a, b) > 0.9);
+
+  const c = extractCueFeatures('short');
+  const d = extractCueFeatures('this is a much much longer line than the other');
+  assert.ok(lengthRatioFit(c, d) < 0.3);
+});
+
+test('punctSimilarity: matches only on flags TRUE somewhere', () => {
+  const a = extractCueFeatures('Really?');
+  const b = extractCueFeatures('Gerçekten?');
+  assert.strictEqual(punctSimilarity(a, b), 1);
+
+  // Neither has any of the tracked punctuation flags — uninformative.
+  const c = extractCueFeatures('hello');
+  const d = extractCueFeatures('world');
+  assert.strictEqual(punctSimilarity(c, d), 0);
+});
+
+test('isHighConfidenceTextMatch: triggers on shared digit token', () => {
+  const a = extractCueFeatures('In 1985 we met');
+  const b = extractCueFeatures('En 1985 nous nous sommes rencontrés');
+  assert.strictEqual(isHighConfidenceTextMatch(a, b), true);
+
+  const c = extractCueFeatures('No digits');
+  assert.strictEqual(isHighConfidenceTextMatch(a, c), false);
+});
+
+test('textSimilarity: digit-driven score dominates length+punct soft signals', () => {
+  // a/b agree on digit "1985" + same end punctuation → high score.
+  // a/c have no digits but similar length+punct → moderate score.
+  const a = extractCueFeatures('In 1985 we met?');
+  const b = extractCueFeatures('1985 - did we?');
+  const c = extractCueFeatures('Where are you?');
+  assert.ok(textSimilarity(a, b) > textSimilarity(a, c));
+});
+
+test('buildFeatureArray: parallel to cue array, safe for cues without text', () => {
+  const cues = [
+    { startMs: 0, endMs: 1000, text: 'In 1985' },
+    { startMs: 1000, endMs: 2000 },
+    { startMs: 2000, endMs: 3000, text: '' }
+  ];
+  const feats = buildFeatureArray(cues);
+  assert.strictEqual(feats.length, 3);
+  assert.deepStrictEqual(feats[0].digits, ['1985']);
+  assert.deepStrictEqual(feats[1].digits, []);
+  assert.deepStrictEqual(feats[2].digits, []);
+});
+
+// ============================================================================
+// syncEngine — text-feature-driven alignment
+// ============================================================================
+console.log('\n--- syncEngine.alignAndMatch (text features) ---');
+
+const { alignAndMatch: alignAndMatchTxt } = require('./lib/syncEngine');
+
+test('alignAndMatch: shared digit pairs win over a temporally-closer non-digit cue', () => {
+  // Main cue "In 1985 we met." Two trans candidates overlap it heavily.
+  // One has no digits; the other shares "1985". Text features should
+  // pick the digit-sharing cue even though both timings are valid.
+  const main = [
+    { startMs: 5000, endMs: 7000, text: 'In 1985 we met.' }
+  ];
+  const trans = [
+    { startMs: 4800, endMs: 6800, text: 'Nous nous rencontrions.' },
+    { startMs: 5400, endMs: 7400, text: 'En 1985 nous nous sommes rencontrés.' }
+  ];
+  const result = alignAndMatchTxt(main, trans, { enableOffset: false, enableDrift: false, enableLocalOffsets: false });
+  assert.ok(result.matches.has(0));
+  const matched = result.matches.get(0);
+  // Trans index 1 has the shared "1985"; we expect it to be the picked one.
+  assert.ok(matched.includes(1));
+});
+
+test('alignAndMatch: digit contradiction blocks a timing-perfect pairing', () => {
+  // Without text features, this would match perfectly (full overlap).
+  // With text features, "Apollo 13" vs "Apollo 11" is rejected outright.
+  const main = [
+    { startMs: 5000, endMs: 7000, text: 'Apollo 13 launched.' }
+  ];
+  const trans = [
+    { startMs: 5000, endMs: 7000, text: 'Apollo 11 a décollé.' }
+  ];
+  const result = alignAndMatchTxt(main, trans, {
+    enableOffset: false, enableDrift: false, enableLocalOffsets: false
   });
-  const parsed = new URL(url);
+  assert.strictEqual(result.matches.has(0), false);
 
-  assert.strictEqual(buildMyMemoryUrl({}), 'https://api.mymemory.translated.net/get');
-  assert.strictEqual(`${parsed.origin}${parsed.pathname}`, 'https://api.mymemory.translated.net/get');
-  assert.strictEqual(parsed.searchParams.get('q'), 'Hello world');
-  assert.strictEqual(parsed.searchParams.get('langpair'), 'en|tr');
-  assert.strictEqual(parsed.searchParams.get('mt'), '1');
-  assert.strictEqual(parsed.searchParams.get('de'), 'dev@example.com');
+  // Sanity check: with text features disabled, the same input DOES match,
+  // proving the new rejection is what's making the difference.
+  const baseline = alignAndMatchTxt(main, trans, {
+    enableOffset: false, enableDrift: false, enableLocalOffsets: false,
+    enableTextFeatures: false
+  });
+  assert.strictEqual(baseline.matches.has(0), true);
 });
 
-test('translation: maps addon language codes to MyMemory language codes', () => {
-  assert.strictEqual(toTranslationLanguageCode('eng'), 'en');
-  assert.strictEqual(toTranslationLanguageCode('tur'), 'tr');
-  assert.strictEqual(toTranslationLanguageCode('pob'), 'pt');
-  assert.strictEqual(toTranslationLanguageCode('zht'), 'zh-TW');
-});
+// ============================================================================
+// Multi-sentence cue splitter
+// ============================================================================
+console.log('\n--- splitIntoSentences / splitMultiSentenceCues ---');
 
-test('translation: chunks MyMemory text by UTF-8 byte budget', () => {
+test('splitIntoSentences: splits English at clean . space-uppercase boundaries', () => {
   assert.deepStrictEqual(
-    chunkMyMemoryText('aa bb cccc dd', { maxBytes: 4 }),
-    ['aa', 'bb', 'cccc', 'dd']
-  );
-  assert.strictEqual(
-    chunkMyMemoryText('ééé', { maxBytes: 4 }).length,
-    2
+    splitIntoSentences('I was eating. You were dirty.'),
+    ['I was eating.', 'You were dirty.']
   );
 });
 
-test('translation: normalizes MyMemory response shape', () => {
-  assert.strictEqual(
-    normalizeMyMemoryResponse({
-      responseStatus: 200,
-      responseData: { translatedText: 'Merhaba dunya' }
-    }),
-    'Merhaba dunya'
+test('splitIntoSentences: splits Arabic at ؟ boundaries', () => {
+  const arabic = 'ألم يكن باستطاعتك فعل هذا قبل ساعة؟ كنت آكل وأنت مُتسخ.';
+  assert.deepStrictEqual(
+    splitIntoSentences(arabic),
+    [
+      'ألم يكن باستطاعتك فعل هذا قبل ساعة؟',
+      'كنت آكل وأنت مُتسخ.'
+    ]
   );
-  assert.throws(
-    () => normalizeMyMemoryResponse({ responseStatus: 403, responseDetails: 'quota exceeded' }),
-    /quota exceeded/
+});
+
+test('splitIntoSentences: stays whole for single-sentence text', () => {
+  assert.deepStrictEqual(
+    splitIntoSentences('A single sentence.'),
+    ['A single sentence.']
   );
-  assert.throws(
-    () => normalizeMyMemoryResponse({ responseStatus: 200 }),
-    /translatedText/
+});
+
+test('splitMultiSentenceCues: splits the screenshot Arabic cue', () => {
+  const arabic = [{
+    startMs: 60000,
+    endMs: 64000,
+    text: 'ألم يكن باستطاعتك فعل هذا قبل ساعة؟ كنت آكل وأنت مُتسخ.'
+  }];
+  const out = splitMultiSentenceCues(arabic);
+  assert.strictEqual(out.length, 2);
+  assert.ok(out[0].text.endsWith('؟'));
+  assert.ok(out[1].text.endsWith('.'));
+  // Timing is contiguous and bounded by the original cue.
+  assert.strictEqual(out[0].startMs, 60000);
+  assert.strictEqual(out[1].endMs, 64000);
+  assert.ok(out[0].endMs > out[0].startMs);
+  assert.ok(out[1].startMs >= out[0].endMs);
+});
+
+test('splitMultiSentenceCues: leaves short rapid-fire cues alone', () => {
+  // 1.5s cue is below the duration floor; stays as one cue.
+  const rapid = [{
+    startMs: 0,
+    endMs: 1500,
+    text: 'Yes. No. Maybe so. Indeed.'
+  }];
+  const out = splitMultiSentenceCues(rapid);
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].text, 'Yes. No. Maybe so. Indeed.');
+});
+
+test('splitMultiSentenceCues: refuses to split when an abbreviation creates a tiny segment', () => {
+  // The candidate "segment" "Mr" is well under the 15-char floor, so we
+  // refuse the whole split rather than producing a junk fragment.
+  const cue = [{
+    startMs: 0,
+    endMs: 3000,
+    text: 'He said hi. Mr. Smith left the room.'
+  }];
+  const out = splitMultiSentenceCues(cue);
+  assert.strictEqual(out.length, 1);
+});
+
+test('splitMultiSentenceCues: distributes timing proportionally to segment length', () => {
+  // First segment is 50% longer than the second — share of the time
+  // budget should reflect that.
+  const cue = [{
+    startMs: 0,
+    endMs: 5000,
+    text: 'This is the longer first half here. Shorter second one.'
+  }];
+  const out = splitMultiSentenceCues(cue);
+  assert.strictEqual(out.length, 2);
+  const firstDur = out[0].endMs - out[0].startMs;
+  const secondDur = out[1].endMs - out[1].startMs;
+  assert.ok(firstDur > secondDur, 'longer segment should take longer slice');
+});
+
+test('alignAndMatch: Pass 2 wall stops absorption across a sentence terminator', () => {
+  // Setup: ONE main cue that timing-wise overlaps TWO adjacent trans
+  // cues — but the first trans cue ends a sentence. Without the wall,
+  // Pass 1 picks one and Pass 2 absorbs the other, gluing them together.
+  // With the wall, only the bipartite-best pair stays.
+  const main = [
+    { startMs: 0, endMs: 5000, text: 'I was eating, and you are dirty.' }
+  ];
+  const trans = [
+    { startMs:    0, endMs: 2500, text: 'Could you not have done this before?' },
+    { startMs: 2500, endMs: 5000, text: 'I was eating and you are dirty.' }
+  ];
+  const result = alignAndMatchTxt(main, trans, {
+    enableOffset: false, enableDrift: false, enableLocalOffsets: false
+  });
+  const picked = result.matches.get(0) || [];
+  // Only one trans cue should be matched — the bipartite-best one.
+  // Without the wall this came out as [0, 1].
+  assert.strictEqual(picked.length, 1, 'wall should stop multi-trans absorption across sentence end');
+});
+
+test('alignAndMatch: recovers from off-by-one shift via candidate-offset search', () => {
+  // Rick-and-Morty failure mode: trans track is constantly shifted ~3s
+  // late. Pure-overlap matching pairs every trans cue with the NEXT main
+  // (one position too late). Signal correlator is too timid in dense
+  // dialogue; sequence estimator catches it. Multi-candidate selection
+  // applies the sequence offset and recovers the correct pairing.
+  const SHIFT = 3000;
+  const main = [];
+  const trans = [];
+  for (let i = 0; i < 12; i++) {
+    const start = 10000 + i * 3000;
+    main.push({ startMs: start, endMs: start + 2000, text: `Line ${i + 1}.` });
+    trans.push({ startMs: start + SHIFT, endMs: start + SHIFT + 2000, text: `Reply ${i + 1}.` });
+  }
+
+  const result = alignAndMatchTxt(main, trans, {
+    enableDrift: false,
+    enableLocalOffsets: false
+  });
+
+  // Without recovery, each main would pair with the next trans (one off);
+  // with recovery, main[i] pairs with trans[i].
+  for (let i = 0; i < main.length; i++) {
+    const picked = result.matches.get(i);
+    assert.ok(picked && picked.length > 0, `main[${i}] should have a match`);
+    assert.strictEqual(picked[0], i, `main[${i}] should pair with trans[${i}], got trans[${picked[0]}]`);
+  }
+  assert.ok(result.offsetMs !== 0, 'a non-zero offset should be applied');
+});
+
+test('alignAndMatch: leaves correctly-aligned tracks alone (no spurious offset)', () => {
+  // Inverse safety check: with no shift between tracks, no offset should
+  // be applied. Strict-`>` tie-break means `0` stays the winner.
+  const main = [];
+  const trans = [];
+  for (let i = 0; i < 10; i++) {
+    const start = 5000 + i * 2000;
+    main.push({ startMs: start, endMs: start + 1500, text: `Line ${i + 1}.` });
+    trans.push({ startMs: start, endMs: start + 1500, text: `Reply ${i + 1}.` });
+  }
+  const result = alignAndMatchTxt(main, trans, {
+    enableDrift: false,
+    enableLocalOffsets: false
+  });
+  assert.strictEqual(result.offsetMs, 0, 'no shift should be applied to aligned tracks');
+});
+
+test('sentenceShapeSignal: +1 both end, -1 mixed, 0 both mid-fragment', () => {
+  const { sentenceShapeSignal, extractCueFeatures: extract } = require('./lib/textFeatures');
+  const sentence = extract('A complete sentence.');
+  const fragment = extract('a mid-fragment continuation');
+  assert.strictEqual(sentenceShapeSignal(sentence, sentence), 1);
+  assert.strictEqual(sentenceShapeSignal(sentence, fragment), -1);
+  assert.strictEqual(sentenceShapeSignal(fragment, fragment), 0);
+});
+
+test('textSimilarity: penalizes endsSentence mismatch (rules out fragment misalignment)', () => {
+  const { textSimilarity, extractCueFeatures: extract } = require('./lib/textFeatures');
+  const sentenceMain = extract('Total waste of snakes.');
+  const sentenceTrans = extract('Total waste of snakes.');  // same shape — both terminal
+  const fragmentTrans = extract('If you want to take a beat');  // mid-fragment, no terminator
+  // The shape-matching pair should score strictly higher than the
+  // mid-fragment pair, even though all three are similar lengths.
+  assert.ok(
+    textSimilarity(sentenceMain, sentenceTrans) > textSimilarity(sentenceMain, fragmentTrans),
+    'sentence-shape mismatch should drag the similarity score down'
   );
+});
+
+test('mergeSubtitles: split secondary cue is distributed across two main cues', () => {
+  // The actual screenshot scenario: English file has two separate cues;
+  // Arabic file has both sentences packed into one long cue. We expect
+  // the splitter to produce two Arabic cues, and the bipartite matcher
+  // to pair each with the corresponding English cue.
+  const main = [
+    { id: '1', startTime: '00:01:00,000', endTime: '00:01:02,000',
+      text: 'Could you not have done this an hour ago?' },
+    { id: '2', startTime: '00:01:02,000', endTime: '00:01:04,000',
+      text: 'I was eating, and you are dirty.' }
+  ];
+  const trans = [
+    { id: '1', startTime: '00:01:00,000', endTime: '00:01:04,000',
+      text: 'ألم يكن باستطاعتك فعل هذا قبل ساعة؟ كنت آكل وأنت مُتسخ.' }
+  ];
+  const merged = mergeSubtitles(main, trans, {
+    mainLang: 'eng', transLang: 'ara',
+    enableOffset: false, enableDrift: false
+  });
+
+  assert.strictEqual(merged.length, 2);
+  // First merged cue: English question + first Arabic sentence (ends with ؟).
+  assert.ok(merged[0].text.includes('done this'));
+  assert.ok(merged[0].text.includes('؟'));
+  assert.ok(!merged[0].text.includes('مُتسخ'), 'first merged cue must not carry the second sentence');
+  // Second merged cue: English statement + second Arabic sentence.
+  assert.ok(merged[1].text.includes('I was eating'));
+  assert.ok(merged[1].text.includes('مُتسخ'));
+  assert.ok(!merged[1].text.includes('ساعة؟'), 'second merged cue must not carry the first sentence');
+});
+
+// ============================================================================
+// ASS/SSA parser
+// ============================================================================
+console.log('\n--- normalizeAssToSrt / isAssFormat ---');
+
+const ASS_SAMPLE = `[Script Info]
+Title: Test
+ScriptType: v4.00+
+PlayDepth: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,{\\an8}Hello World
+Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,Line two{\\fad(0,200)} text
+Dialogue: 0,0:00:07.00,0:00:09.00,Default,,0,0,0,,{\\pos(320,400)}Override stripped
+`;
+
+test('isAssFormat: detects ASS/SSA by Script Info header', () => {
+  assert.strictEqual(isAssFormat(ASS_SAMPLE), true);
+  assert.strictEqual(isAssFormat('1\n00:00:01,000 --> 00:00:03,000\nHello\n\n'), false);
+  assert.strictEqual(isAssFormat('WEBVTT\n\n1\n00:00:01.000 --> 00:00:03.000\nHi\n'), false);
+});
+
+test('normalizeAssToSrt: converts ASS dialogue to SRT timestamps (centiseconds)', () => {
+  const srt = normalizeAssToSrt(ASS_SAMPLE);
+  // 0:00:01.00 → 00:00:01,000 ; 0:00:03.50 → 00:00:03,500
+  assert.ok(srt.includes('00:00:01,000 --> 00:00:03,500'), `timing: ${srt.slice(0, 200)}`);
+  assert.ok(srt.includes('00:00:04,000 --> 00:00:06,000'), 'second timing');
+});
+
+test('normalizeAssToSrt: strips ASS override tags from text', () => {
+  const srt = normalizeAssToSrt(ASS_SAMPLE);
+  assert.ok(!srt.includes('{\\'), 'override tags should be stripped');
+  assert.ok(srt.includes('Hello World'), 'text should survive');
+  assert.ok(srt.includes('Line two text'), 'override inside text should strip cleanly');
+  assert.ok(srt.includes('Override stripped'), 'pos override should be stripped');
+});
+
+test('parseSrt: handles ASS input end-to-end', () => {
+  const cues = parseSrt(ASS_SAMPLE);
+  assert.ok(Array.isArray(cues) && cues.length >= 3, `expected 3+ cues, got ${cues ? cues.length : 'null'}`);
+  assert.ok(cues[0].text.includes('Hello World'), `first cue text: ${cues[0].text}`);
+});
+
+// ============================================================================
+// Kitsu ID parsing
+// ============================================================================
+console.log('\n--- parseKitsuId ---');
+
+test('parseKitsuId: parses kitsu movie ID', () => {
+  const r = parseKitsuId('kitsu:12345');
+  assert.deepStrictEqual(r, { kitsuId: '12345', season: null, episode: null });
+});
+
+test('parseKitsuId: parses kitsu series ID with season+episode', () => {
+  const r = parseKitsuId('kitsu:12345:1:5');
+  assert.deepStrictEqual(r, { kitsuId: '12345', season: '1', episode: '5' });
+});
+
+test('parseKitsuId: returns null for IMDb IDs', () => {
+  assert.strictEqual(parseKitsuId('tt1234567'), null);
+  assert.strictEqual(parseKitsuId(null), null);
+  assert.strictEqual(parseKitsuId(''), null);
+});
+
+// ============================================================================
+// parseConfigParam (server.js)
+// ============================================================================
+console.log('\n--- parseConfigParam ---');
+
+test('parseConfigParam: parses legacy two-field format', () => {
+  const r = parseConfigParam(encodeURIComponent('English [eng]|Turkish [tur]'));
+  assert.strictEqual(r.mainLang, 'English [eng]');
+  assert.strictEqual(r.transLang, 'Turkish [tur]');
+  assert.deepStrictEqual(r.envOverrides, {});
+});
+
+test('parseConfigParam: parses all API key fields', () => {
+  const raw = encodeURIComponent('English [eng]|Turkish [tur]|wyzie=wk|subdl=sk|jimaku=jk|lt=http://localhost:5000|ltkey=lk');
+  const r = parseConfigParam(raw);
+  assert.strictEqual(r.mainLang, 'English [eng]');
+  assert.deepStrictEqual(r.envOverrides, {
+    WYZIE_API_KEY: 'wk',
+    SUBDL_API_KEY: 'sk',
+    JIMAKU_API_KEY: 'jk',
+    LIBRETRANSLATE_URL: 'http://localhost:5000',
+    LIBRETRANSLATE_API_KEY: 'lk'
+  });
+});
+
+test('parseConfigParam: returns null for empty/invalid input', () => {
+  assert.strictEqual(parseConfigParam(''), null);
+  assert.strictEqual(parseConfigParam(null), null);
+  assert.strictEqual(parseConfigParam(encodeURIComponent('onlyone')), null);
+});
+
+test('parseConfigParam: ignores unknown extra keys', () => {
+  const raw = encodeURIComponent('English [eng]|Turkish [tur]|unknown=val');
+  const r = parseConfigParam(raw);
+  assert.deepStrictEqual(r.envOverrides, {});
+});
+
+test('manifest: includes kitsu in idPrefixes', () => {
+  assert.ok(manifest.idPrefixes.includes('kitsu'), 'kitsu must be in idPrefixes for anime support');
+  assert.ok(manifest.idPrefixes.includes('tt'), 'tt must still be in idPrefixes');
 });
 
 // ============================================================================

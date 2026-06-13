@@ -48,7 +48,6 @@ A Stremio addon that displays **two subtitle languages simultaneously** - design
 | **Dual Display** | Two languages at once - primary line emphasized, second line with softer styling where supported |
 | **70+ Languages** | Full OpenSubtitles language support, plus optional extra source adapters |
 | **Smart Sync** | Intelligent time-based subtitle merging algorithm |
-| **Machine Translation** | Optional translated-primary subtitle track via MyMemory's free public API |
 | **Encoding Support** | UTF-8, UTF-16, Windows codepages, ISO-8859 variants |
 | **No Registration** | Works instantly without API keys or accounts |
 | **Privacy First** | No personal data collection, fully open source |
@@ -328,12 +327,6 @@ OpenSubtitles remains enabled by default because it already returns IMDb/file-aw
 | SubtitleCat | Registered candidate | Needs a direct subtitle-file adapter |
 | SubtitleBot | Registered candidate | Search/translation product; no addon adapter yet |
 
-### Machine Translation
-
-Stremio gets an extra subtitle option labeled `Translate primary`. It downloads the selected primary subtitle, translates that text into the secondary language, and renders the generated translation under the original primary line using the primary timing.
-
-Translation uses MyMemory's free public API, with no subscription or key. Anonymous usage is limited, so set `MYMEMORY_EMAIL` to use MyMemory's higher free quota.
-
 ### Merging Algorithm
 
 The addon uses a time-based matching algorithm:
@@ -444,9 +437,6 @@ A: Yes. Install Stremio on your TV, then add the addon using the manifest URL or
 
 **Q: Why are some subtitles missing translations?**
 A: If the enabled sources do not have subtitles for your chosen language pair for that specific content, no dual subtitles will be available.
-
-**Q: Can the addon translate subtitles automatically?**
-A: Yes. The `Translate primary` option uses the free MyMemory API.
 
 **Q: Is my data collected?**
 A: No personal data is collected. Anonymous usage statistics (page views, language preferences) may be tracked for analytics purposes only.

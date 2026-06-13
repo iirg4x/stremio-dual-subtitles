@@ -194,16 +194,6 @@ function getLanguageName(code) {
   return languageMap[code] || code;
 }
 
-/**
- * Get formatted language option by code.
- * @param {string} code - ISO 639-3 language code
- * @returns {string} Formatted option "Language Name [code]"
- */
-function getLanguageOption(code) {
-  const name = languageMap[code] || code;
-  return `${name} [${code}]`;
-}
-
 module.exports = {
   languageMap,
   browserLanguageMap,
@@ -212,5 +202,4 @@ module.exports = {
   extractBrowserLanguage,
   parseLangCode,
   getLanguageName,
-  getLanguageOption,
 };
